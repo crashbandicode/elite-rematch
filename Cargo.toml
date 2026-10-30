@@ -1,0 +1,35 @@
+[package]
+name = "elite-rematch"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Skyline plugin for Super Smash Bros. Ultimate 13.0.5 that keeps the online rematch when a player enters or leaves Elite Smash, with an indicator"
+license = "MIT"
+
+[package.metadata.skyline]
+titleid = "01006A800016E000"
+
+[features]
+# Eden-only diagnostics (forcing an Elite Smash change for tests); never in the shipped NRO.
+diag = []
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[target.'cfg(target_os = "switch")'.dependencies]
+skyline = "=0.6.0"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+# Size over speed: the mapped NRO is the game-heap cost (as in the other plugins).
+opt-level = "s"
+debug = 2
+strip = false
+lto = true
+codegen-units = 1
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("switch"))'] }

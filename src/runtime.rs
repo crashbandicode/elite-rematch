@@ -1,0 +1,485 @@
+//! Switch half: version check, guarded inline hooks on the post-match popup,
+//! an event ring and a writer thread that appends `events.log`.
+//!
+//! Hooks run on the game's UI thread and only format a line into a static
+//! ring; the writer thread does the file I/O. No heap (`heap_allocations` in
+//! the install line counts any).
+
+use crate::model::{self, descriptor, Change, Line, Plan, Settings, Site};
+use core::cell::UnsafeCell;
+use core::fmt::Write as _;
+use skyline::hooks::{getRegionAddress, InlineCtx, Region};
+use skyline::nn;
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
+
+const DATA_DIR: &str = "sd:/ultimate/elite-rematch";
+const EVENT_RING: usize = 16;
+const EVENT_LEN: usize = 448;
+const WRITER_STACK: usize = 32 * 1024;
+#[cfg(feature = "diag")]
+const OPEN_READ: i32 = 1;
+const OPEN_WRITE_APPEND: i32 = 2 | 4;
+
+/// Counts calls into the heap. Nothing in the plugin is meant to make one.
+struct CountingAllocator;
+static HEAP_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        HEAP_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        System.alloc(layout)
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        HEAP_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        System.alloc_zeroed(layout)
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        HEAP_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        System.realloc(ptr, layout, size)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        System.dealloc(ptr, layout)
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+/// Shared cell whose accesses are ordered by the surrounding atomics.
+struct Owned<T>(UnsafeCell<T>);
+// SAFETY: see each use; writers publish through a sequence number or before
+// the hooks are installed.
+unsafe impl<T> Sync for Owned<T> {}
+
+/// One formatted line; `seq` is the event index + 1 once it is complete.
+struct EventSlot {
+    seq: AtomicU64,
+    text: Owned<Line<EVENT_LEN>>,
+}
+
+static EVENTS: [EventSlot; EVENT_RING] = [const {
+    EventSlot {
+        seq: AtomicU64::new(0),
+        text: Owned(UnsafeCell::new(Line::new())),
+    }
+}; EVENT_RING];
+static EVENT_HEAD: AtomicU64 = AtomicU64::new(0);
+
+static TEXT_BASE: AtomicU64 = AtomicU64::new(0);
+/// The popup on screen: 0 ordinary, 1/2 entered/left as the game shows it,
+/// 3/4 entered/left with the rematch kept.
+static SHOWN: AtomicU32 = AtomicU32::new(0);
+/// Written once in `main` before any hook is installed.
+static SETTINGS: Owned<Settings> = Owned(UnsafeCell::new(Settings::DEFAULT));
+
+/// The writer thread's object and stack, static so no heap is involved.
+#[repr(C, align(4096))]
+struct ThreadStack(UnsafeCell<[u8; WRITER_STACK]>);
+#[repr(C, align(16))]
+struct ThreadObject(UnsafeCell<[u8; 0x1c0]>);
+// SAFETY: handed to nn::os once, at startup, and never touched again.
+unsafe impl Sync for ThreadStack {}
+unsafe impl Sync for ThreadObject {}
+static WRITER_STACK_MEMORY: ThreadStack = ThreadStack(UnsafeCell::new([0; WRITER_STACK]));
+static WRITER_THREAD: ThreadObject = ThreadObject(UnsafeCell::new([0; 0x1c0]));
+
+fn tick() -> u64 {
+    unsafe { nn::os::GetSystemTick() as u64 }
+}
+
+unsafe fn read_u32(address: u64) -> u32 {
+    (address as *const u32).read_unaligned()
+}
+
+unsafe fn read_u64(address: u64) -> u64 {
+    (address as *const u64).read_unaligned()
+}
+
+fn settings() -> Settings {
+    // SAFETY: only written in `main` before the hooks exist.
+    unsafe { *SETTINGS.0.get() }
+}
+
+fn push_event(args: core::fmt::Arguments) {
+    let index = EVENT_HEAD.fetch_add(1, Ordering::AcqRel);
+    let slot = &EVENTS[index as usize % EVENT_RING];
+    slot.seq.store(0, Ordering::Release);
+    // SAFETY: this index owns the slot until it publishes `seq`; the writer
+    // re-checks `seq` after copying and drops a line overwritten meanwhile.
+    let text = unsafe { &mut *slot.text.0.get() };
+    text.clear();
+    let _ = write!(text, "{} ", tick());
+    let _ = text.write_fmt(args);
+    let _ = text.write_char('\n');
+    slot.seq.store(index + 1, Ordering::Release);
+}
+
+fn shown_name(shown: u32) -> &'static str {
+    match shown {
+        1 => "entered_native",
+        2 => "left_native",
+        3 => "entered_kept",
+        4 => "left_kept",
+        _ => "ordinary",
+    }
+}
+
+/// Eden-only: replaces the ordinary record with the forced Elite Smash one,
+/// as if the fighter had just entered or left Elite Smash.
+#[cfg(feature = "diag")]
+#[skyline::hook(offset = model::SELECT_OFFSET, inline)]
+unsafe fn popup_select(ctx: &mut InlineCtx) {
+    let Some(change) = settings().force else {
+        return;
+    };
+    let record = ctx.registers[20].x();
+    if record == model::POPUP_ORDINARY {
+        ctx.registers[20].set_x(change.record());
+        push_event(format_args!(
+            "diag force={} record={record:#x}",
+            change.name()
+        ));
+    }
+}
+
+#[cfg(feature = "diag")]
+unsafe fn log_descriptor(stage: &str, d: u64) {
+    use descriptor::*;
+    let text = |offset: usize| {
+        model::label(core::slice::from_raw_parts(
+            (d as usize + offset) as *const u8,
+            LABEL_LEN,
+        ))
+    };
+    push_event(format_args!(
+        "diag {stage} record={:#x} style={} default={} body_hash={:#x} body={} b1={} b2={} b3={} args={:#x}:{:#x}",
+        read_u64(d + RECORD as u64),
+        read_u32(d + STYLE as u64),
+        read_u32(d + DEFAULT_BUTTON as u64),
+        read_u32(d + BODY as u64),
+        text(BODY_LABEL),
+        text(BUTTON_LABELS[0]),
+        text(BUTTON_LABELS[1]),
+        text(BUTTON_LABELS[2]),
+        read_u64(d + 0x140),
+        read_u64(d + 0x148),
+    ));
+}
+
+/// The parsed popup, before it is shown. For an Elite Smash change, parses
+/// the ordinary (rematch) record into the same descriptor with the game's own
+/// parser, then puts the Elite Smash text back.
+#[skyline::hook(offset = model::PARSED_OFFSET, inline)]
+unsafe fn popup_parsed(ctx: &mut InlineCtx) {
+    let record = ctx.registers[20].x();
+    let descriptor = read_u64(ctx.registers[19].x() + 0x10);
+    #[cfg(feature = "diag")]
+    log_descriptor("parsed", descriptor);
+    let settings = settings();
+    match model::plan(record, settings.retain, settings.body) {
+        Plan::Keep => {
+            let change = Change::of(record);
+            SHOWN.store(
+                match change {
+                    Some(Change::Entered) => 1,
+                    Some(Change::Left) => 2,
+                    None => 0,
+                },
+                Ordering::Release,
+            );
+            push_event(format_args!(
+                "popup record={record:#x} change={} rematch=native",
+                change.map_or("none", Change::name)
+            ));
+        }
+        Plan::Reparse { change, keep_body } => {
+            let body = (descriptor as usize + descriptor::BODY) as *mut u8;
+            let mut saved = [0u8; descriptor::BODY_END - descriptor::BODY];
+            if keep_body {
+                core::ptr::copy_nonoverlapping(body, saved.as_mut_ptr(), saved.len());
+            }
+            let parse = core::mem::transmute::<*const (), extern "C" fn(u64, u64)>(
+                (TEXT_BASE.load(Ordering::Relaxed) as usize + model::PARSE_POPUP_OFFSET)
+                    as *const (),
+            );
+            parse(descriptor, model::POPUP_ORDINARY);
+            if keep_body {
+                core::ptr::copy_nonoverlapping(saved.as_ptr(), body, saved.len());
+            }
+            SHOWN.store(
+                match change {
+                    Change::Entered => 3,
+                    Change::Left => 4,
+                },
+                Ordering::Release,
+            );
+            push_event(format_args!(
+                "popup record={record:#x} change={} rematch=kept body={}",
+                change.name(),
+                if keep_body { "elite" } else { "rematch" }
+            ));
+            #[cfg(feature = "diag")]
+            log_descriptor("reparsed", descriptor);
+        }
+    }
+}
+
+/// The popup's completion (read-only): which button was chosen.
+#[skyline::hook(offset = model::CHOICE_OFFSET, inline)]
+unsafe fn popup_choice(ctx: &mut InlineCtx) {
+    let button = read_u32(ctx.registers[8].x() + 0x118);
+    let shown = SHOWN.swap(0, Ordering::AcqRel);
+    push_event(format_args!(
+        "choice button={button} rematch={} popup={}",
+        u8::from(button == model::REMATCH_BUTTON),
+        shown_name(shown)
+    ));
+}
+
+type Path = Line<96>;
+
+fn path(args: core::fmt::Arguments) -> Path {
+    let mut path = Path::new();
+    let _ = path.write_fmt(args);
+    path
+}
+
+/// An `nn::fs` file opened to append; closed on drop. A closed file is on
+/// the card at once, while Eden keeps an open file's writes until the host
+/// file is closed (its `FlushFile` does not reach the host).
+struct NxFile {
+    handle: nn::fs::FileHandle,
+    offset: i64,
+}
+
+impl NxFile {
+    fn append(path: &mut Path) -> Option<Self> {
+        let path = path.with_nul()?.as_ptr();
+        unsafe {
+            // Fails harmlessly when the file exists.
+            nn::fs::CreateFile(path, 0);
+            let mut handle = nn::fs::FileHandle { handle: 0 };
+            if nn::fs::OpenFile(&mut handle, path, OPEN_WRITE_APPEND) != 0 {
+                return None;
+            }
+            let mut offset = 0;
+            if nn::fs::GetFileSize(&mut offset, handle) != 0 {
+                nn::fs::CloseFile(handle);
+                return None;
+            }
+            Some(Self { handle, offset })
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> bool {
+        let option = nn::fs::WriteOption { flags: 0 };
+        let written = unsafe {
+            nn::fs::WriteFile(
+                self.handle,
+                self.offset,
+                bytes.as_ptr(),
+                bytes.len() as u64,
+                &option,
+            )
+        } == 0;
+        if written {
+            self.offset += bytes.len() as i64;
+        }
+        written
+    }
+}
+
+impl Drop for NxFile {
+    fn drop(&mut self) {
+        unsafe {
+            nn::fs::FlushFile(self.handle);
+            nn::fs::CloseFile(self.handle);
+        }
+    }
+}
+
+fn append_log(bytes: &[u8]) {
+    if let Some(mut log) = NxFile::append(&mut path(format_args!("{DATA_DIR}/events.log"))) {
+        log.write(bytes);
+    }
+}
+
+#[cfg(feature = "diag")]
+fn read_settings() -> Settings {
+    let mut file = path(format_args!("{DATA_DIR}/diag.txt"));
+    let Some(file) = file.with_nul() else {
+        return Settings::DEFAULT;
+    };
+    let mut buf = [0u8; 256];
+    let mut read = 0u64;
+    unsafe {
+        let mut handle = nn::fs::FileHandle { handle: 0 };
+        if nn::fs::OpenFile(&mut handle, file.as_ptr(), OPEN_READ) != 0 {
+            return Settings::DEFAULT;
+        }
+        let ok = nn::fs::ReadFile1(&mut read, handle, 0, buf.as_mut_ptr(), buf.len() as u64) == 0;
+        nn::fs::CloseFile(handle);
+        if !ok {
+            return Settings::DEFAULT;
+        }
+    }
+    Settings::parse(&buf[..(read as usize).min(buf.len())])
+}
+
+/// Copies every published event after `tail` into `events.log`.
+fn drain(tail: &mut u64) {
+    let head = EVENT_HEAD.load(Ordering::Acquire);
+    if head == *tail {
+        return;
+    }
+    if head - *tail > EVENT_RING as u64 {
+        *tail = head - EVENT_RING as u64;
+    }
+    let Some(mut file) = NxFile::append(&mut path(format_args!("{DATA_DIR}/events.log"))) else {
+        return;
+    };
+    while *tail < head {
+        let slot = &EVENTS[*tail as usize % EVENT_RING];
+        let seq = slot.seq.load(Ordering::Acquire);
+        if seq == 0 || seq < *tail + 1 {
+            break; // still being written
+        }
+        let mut copy = Line::<EVENT_LEN>::new();
+        // SAFETY: read under the sequence check below.
+        let text = unsafe { &*slot.text.0.get() };
+        let _ = copy.write_str(core::str::from_utf8(text.as_bytes()).unwrap_or(""));
+        fence(Ordering::Acquire);
+        if seq == *tail + 1 && slot.seq.load(Ordering::Relaxed) == seq {
+            file.write(copy.as_bytes());
+        }
+        *tail += 1;
+    }
+}
+
+extern "C" fn writer_main(_: *mut skyline::libc::c_void) {
+    let mut tail = 0;
+    loop {
+        unsafe {
+            nn::os::SleepThread(nn::TimeSpan {
+                nanoseconds: 200_000_000,
+            })
+        };
+        drain(&mut tail);
+    }
+}
+
+fn start_writer() -> bool {
+    unsafe {
+        let thread = WRITER_THREAD.0.get().cast::<nn::os::ThreadType>();
+        let priority = nn::os::GetThreadPriority(nn::os::GetCurrentThread());
+        let created = nn::os::CreateThread(
+            thread,
+            writer_main,
+            core::ptr::null_mut(),
+            WRITER_STACK_MEMORY.0.get().cast::<u8>(),
+            WRITER_STACK,
+            priority,
+        );
+        if created != 0 {
+            return false;
+        }
+        nn::os::SetThreadNamePointer(thread, c"elite-rematch".as_ptr().cast());
+        nn::os::StartThread(thread);
+        true
+    }
+}
+
+unsafe fn guard_matches(site: &Site) -> bool {
+    let base = getRegionAddress(Region::Text) as usize;
+    let end = getRegionAddress(Region::Rodata) as usize;
+    let address = base + site.offset;
+    address.is_multiple_of(4)
+        && address + site.guard.len() <= end
+        && core::slice::from_raw_parts(address as *const u8, site.guard.len()) == site.guard
+}
+
+fn version_is_supported() -> bool {
+    let mut version = nn::oe::DisplayVersion { name: [0; 16] };
+    unsafe { nn::oe::GetDisplayVersion(&mut version) };
+    let end = version.name.iter().position(|v| *v == 0).unwrap_or(16);
+    version.name[..end] == *model::SUPPORTED_VERSION.as_bytes()
+}
+
+/// Appends the install line to `events.log` and the Skyline log.
+fn report_install(report: &mut Line<256>) {
+    let _ = write!(
+        report,
+        " heap_allocations={}",
+        HEAP_ALLOCATIONS.load(Ordering::Relaxed)
+    );
+    skyline::logging::log(core::str::from_utf8(report.as_bytes()).unwrap_or(""));
+    let _ = report.write_char('\n');
+    for directory in ["sd:/ultimate", DATA_DIR] {
+        if let Some(directory) = path(format_args!("{directory}")).with_nul() {
+            unsafe { nn::fs::CreateDirectory(directory.as_ptr()) };
+        }
+    }
+    append_log(report.as_bytes());
+}
+
+#[skyline::main(name = "elite-rematch")]
+pub fn main() {
+    let mut report = Line::<256>::new();
+    let _ = write!(
+        report,
+        "{} plugin=elite-rematch/{}",
+        tick(),
+        env!("CARGO_PKG_VERSION")
+    );
+    if !version_is_supported() {
+        let _ = write!(report, " result=unsupported_version");
+        report_install(&mut report);
+        return;
+    }
+    let sites: &[&Site] = if cfg!(feature = "diag") {
+        &[&model::SELECT, &model::PARSED, &model::CHOICE]
+    } else {
+        &[&model::PARSED, &model::CHOICE]
+    };
+    for site in sites {
+        if !unsafe { guard_matches(site) } {
+            let _ = write!(report, " result=guard_mismatch site={}", site.name);
+            report_install(&mut report);
+            return;
+        }
+    }
+    TEXT_BASE.store(
+        unsafe { getRegionAddress(Region::Text) as u64 },
+        Ordering::Relaxed,
+    );
+    #[cfg(feature = "diag")]
+    {
+        let loaded = read_settings();
+        // SAFETY: no hook is installed yet.
+        unsafe { *SETTINGS.0.get() = loaded };
+        let _ = write!(
+            report,
+            " diag force={} retain={} body={}",
+            loaded.force.map_or("none", Change::name),
+            u8::from(loaded.retain),
+            loaded.body.name()
+        );
+    }
+    skyline::install_hooks!(popup_parsed, popup_choice);
+    #[cfg(feature = "diag")]
+    skyline::install_hook!(popup_select);
+    let _ = write!(report, " result=installed hooks=");
+    for (i, site) in sites.iter().enumerate() {
+        let _ = write!(report, "{}{}", if i > 0 { "," } else { "" }, site.name);
+    }
+    report_install(&mut report);
+    if !start_writer() {
+        report.clear();
+        let _ = write!(report, "{} writer=not_started", tick());
+        report_install(&mut report);
+    }
+}
