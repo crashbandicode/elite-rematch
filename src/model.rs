@@ -18,7 +18,8 @@ use core::fmt;
 
 pub const SUPPORTED_VERSION: &str = "13.0.5";
 
-/// An inline hook site and the 64 bytes that must be there (13.0.5 image).
+/// A hook site and the 64 bytes there in the 13.0.5 image (`entry` says
+/// which other plugins' hooks on them are accepted).
 pub struct Site {
     pub name: &'static str,
     pub offset: usize,
@@ -139,6 +140,125 @@ pub const SEARCH_DELAY: Site = Site {
         0xbf, 0x06, 0x00, 0x71,
     ],
 };
+
+/// Instructions read at a site: its 64 guard bytes.
+pub const SITE_WORDS: usize = 16;
+
+impl Site {
+    /// The 13.0.5 instruction `index` words from the site.
+    pub fn stock(&self, index: usize) -> u32 {
+        let b = &self.guard[index * 4..index * 4 + 4];
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    }
+}
+
+/// Skyline's far jump, `ldr x17, #8; br x17`, then the 8-byte target; a
+/// `nop` comes first where the target would not be 8-byte aligned.
+pub const FAR_JUMP: [u32; 2] = [0x5800_0051, 0xd61f_0220];
+const NOP: u32 = 0xd503_201f;
+
+/// Words a Skyline far jump at `address` takes (the most a hook replaces).
+pub fn hooked_words(address: u64) -> usize {
+    if address.is_multiple_of(8) {
+        4
+    } else {
+        5
+    }
+}
+
+/// A Skyline far jump at the start of `words` (the first one at `address`):
+/// its length in words and, when all of it is in `words`, its target.
+pub fn far_jump(words: &[u32], address: u64) -> Option<(usize, Option<u64>)> {
+    let start = hooked_words(address) - 4;
+    if start == 1 && words.first() != Some(&NOP) {
+        return None;
+    }
+    if words.get(start..start + 2)? != FAR_JUMP {
+        return None;
+    }
+    let target = words
+        .get(start + 2..start + 4)
+        .map(|w| u64::from(w[0]) | (u64::from(w[1]) << 32));
+    Some((start + 4, target))
+}
+
+/// The target of a `b` at `address`.
+pub fn branch(word: u32, address: u64) -> Option<u64> {
+    (word & 0xfc00_0000 == 0x1400_0000)
+        .then(|| address.wrapping_add_signed(i64::from(((word << 6) as i32) >> 4)))
+}
+
+/// What holds a hook site when the plugin loads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Entry {
+    /// The 13.0.5 instructions. Other plugins' hooks may sit further on,
+    /// past the words this plugin's hook replaces.
+    Stock,
+    /// Another plugin's far jump over the site, to this handler, which runs
+    /// the instructions the jump replaced: this plugin's hook continues into
+    /// it (the jump's address word must not be relocated as code).
+    Chain(u64),
+    /// Another plugin's near branch over the first word, to this address.
+    Branch(u64),
+    /// Anything else: the site is left alone.
+    Foreign,
+}
+
+impl Entry {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Stock => "stock",
+            Self::Chain(_) => "chain",
+            Self::Branch(_) => "branch",
+            Self::Foreign => "foreign",
+        }
+    }
+}
+
+/// Reads the site's `words` (at `address`) against its 13.0.5 guard.
+pub fn entry(site: &Site, words: &[u32; SITE_WORDS], address: u64) -> Entry {
+    let (entry, mut i) = match far_jump(words, address) {
+        Some((len, Some(target))) => {
+            let end = address + 4 * len as u64;
+            if target == 0 || !target.is_multiple_of(4) || (address..end).contains(&target) {
+                return Entry::Foreign;
+            }
+            (Entry::Chain(target), len)
+        }
+        Some((_, None)) => return Entry::Foreign,
+        None => match branch(words[0], address) {
+            Some(target) if words[0] != site.stock(0) => (Entry::Branch(target), 1),
+            _ => (Entry::Stock, 0),
+        },
+    };
+    let replaced = hooked_words(address);
+    while i < SITE_WORDS {
+        let at = address + 4 * i as u64;
+        if words[i] == site.stock(i) {
+            i += 1;
+        } else if i < replaced {
+            return Entry::Foreign;
+        } else if let Some((len, _)) = far_jump(&words[i..], at) {
+            i += len;
+        } else if branch(words[i], at).is_some() {
+            i += 1;
+        } else {
+            return Entry::Foreign;
+        }
+    }
+    entry
+}
+
+/// `foreign=1` in `diag.txt`: before its own hooks, the plugin hooks each
+/// release site the way another plugin would, to test chaining onto it.
+pub fn parse_foreign(text: &[u8]) -> bool {
+    text.split(|b| *b == b'\n').fold(false, |on, line| {
+        match line.iter().position(|b| *b == b'=') {
+            Some(eq) if trim(&line[..eq]) == b"foreign" => trim(&line[eq + 1..]) == b"1",
+            _ => on,
+        }
+    })
+}
 
 /// `threshold=<decimal>` in `diag.txt` (the last such line wins);
 /// `threshold=native` or none keeps the game's parameter.
@@ -484,6 +604,112 @@ mod tests {
         assert_eq!(SELECT.guard[..4], [0x68, 0x0a, 0x40, 0xf9]); // ldr x8, [x19, #0x10]
         assert_eq!(PARSED.guard[..4], [0x60, 0x86, 0x40, 0xa9]); // ldp x0, x1, [x19, #8]
         assert_eq!(CHOICE.guard[..4], [0x08, 0x19, 0x41, 0xb9]); // ldr w8, [x8, #0x118]
+    }
+
+    fn stock_words(site: &Site) -> [u32; SITE_WORDS] {
+        core::array::from_fn(|i| site.stock(i))
+    }
+
+    fn far(target: u64) -> [u32; 4] {
+        [
+            FAR_JUMP[0],
+            FAR_JUMP[1],
+            target as u32,
+            (target >> 32) as u32,
+        ]
+    }
+
+    /// `b` from `from` to `to`.
+    fn b(from: u64, to: u64) -> u32 {
+        0x1400_0000 | ((to.wrapping_sub(from) >> 2) as u32 & 0x03ff_ffff)
+    }
+
+    const AT8: u64 = 0x80_0147_f4d0; // 8-byte aligned, like CHOICE
+    const AT4: u64 = 0x80_0147_fb64; // 4 past, like PARSED
+    const HANDLER: u64 = 0x71_2345_6780;
+
+    #[test]
+    fn stock_sites_are_stock() {
+        for (site, at) in [(&CHOICE, AT8), (&PARSED, AT4), (&MESSAGE_LOOKUP, AT8)] {
+            assert_eq!(entry(site, &stock_words(site), at), Entry::Stock);
+        }
+    }
+
+    #[test]
+    fn another_plugins_far_jump_is_chained() {
+        let mut words = stock_words(&CHOICE);
+        words[..4].copy_from_slice(&far(HANDLER));
+        assert_eq!(entry(&CHOICE, &words, AT8), Entry::Chain(HANDLER));
+        // Not 8-byte aligned: Skyline puts a nop first.
+        let mut words = stock_words(&PARSED);
+        words[0] = NOP;
+        words[1..5].copy_from_slice(&far(HANDLER));
+        assert_eq!(entry(&PARSED, &words, AT4), Entry::Chain(HANDLER));
+        // That form without its nop is not Skyline's.
+        let mut words = stock_words(&PARSED);
+        words[..4].copy_from_slice(&far(HANDLER));
+        assert_eq!(entry(&PARSED, &words, AT4), Entry::Foreign);
+    }
+
+    #[test]
+    fn far_jumps_to_nowhere_or_into_themselves_are_foreign() {
+        for target in [0, HANDLER + 2, AT8, AT8 + 8, AT8 + 12] {
+            let mut words = stock_words(&CHOICE);
+            words[..4].copy_from_slice(&far(target));
+            assert_eq!(entry(&CHOICE, &words, AT8), Entry::Foreign, "{target:#x}");
+        }
+        let mut words = stock_words(&CHOICE);
+        words[..4].copy_from_slice(&far(AT8 + 16));
+        assert_eq!(entry(&CHOICE, &words, AT8), Entry::Chain(AT8 + 16));
+    }
+
+    #[test]
+    fn another_plugins_branch_is_found_both_ways() {
+        for to in [AT8 + 0x40_0000, AT8 - 0x40_0000] {
+            let mut words = stock_words(&CHOICE);
+            words[0] = b(AT8, to);
+            assert_eq!(branch(words[0], AT8), Some(to));
+            assert_eq!(entry(&CHOICE, &words, AT8), Entry::Branch(to));
+        }
+    }
+
+    #[test]
+    fn changes_in_the_replaced_words_are_foreign() {
+        for i in 0..hooked_words(AT8) {
+            let mut words = stock_words(&CHOICE);
+            words[i] ^= 0x10;
+            assert_eq!(entry(&CHOICE, &words, AT8), Entry::Foreign, "word {i}");
+        }
+        // A far jump starting inside them.
+        let mut words = stock_words(&CHOICE);
+        words[2..6].copy_from_slice(&far(HANDLER));
+        assert_eq!(entry(&CHOICE, &words, AT8), Entry::Foreign);
+        // A branch over the first word, then something else changed.
+        let mut words = stock_words(&CHOICE);
+        words[0] = b(AT8, HANDLER);
+        words[2] ^= 0x10;
+        assert_eq!(entry(&CHOICE, &words, AT8), Entry::Foreign);
+    }
+
+    #[test]
+    fn other_hooks_past_the_replaced_words_are_accepted() {
+        let mut words = stock_words(&CHOICE);
+        words[6..10].copy_from_slice(&far(HANDLER));
+        words[11] = b(AT8 + 44, HANDLER);
+        words[14..16].copy_from_slice(&FAR_JUMP); // its target is past the window
+        assert_eq!(entry(&CHOICE, &words, AT8), Entry::Stock);
+        words[..4].copy_from_slice(&far(HANDLER));
+        assert_eq!(entry(&CHOICE, &words, AT8), Entry::Chain(HANDLER));
+        // Anything that is not a hook is not (word 13 is an `orr`).
+        words[13] ^= 0x10;
+        assert_eq!(entry(&CHOICE, &words, AT8), Entry::Foreign);
+    }
+
+    #[test]
+    fn foreign_flag_parse() {
+        assert!(!parse_foreign(b""));
+        assert!(parse_foreign(b"force=none\n foreign = 1 \n"));
+        assert!(!parse_foreign(b"foreign=1\nforeign=0\n"));
     }
 
     #[test]

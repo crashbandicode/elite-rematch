@@ -1,14 +1,16 @@
-//! Switch half: version check, guarded inline hooks on the post-match popup,
-//! an event ring and a writer thread that appends `events.log`.
+//! Switch half: version check, guarded hooks on the post-match popup (chained
+//! onto other plugins' hooks on the same sites), an event ring and a writer
+//! thread that appends `events.log`.
 //!
 //! Hooks run on the game's UI thread and only format a line into a static
 //! ring; the writer thread does the file I/O. No heap (`heap_allocations` in
 //! the install line counts any).
 
-use crate::model::{self, descriptor, Body, Change, Line, Plan, Settings, Site};
+use crate::model::{self, descriptor, Body, Change, Entry, Line, Plan, Settings, Site};
 use core::cell::UnsafeCell;
 use core::fmt::Write as _;
-use skyline::hooks::{getRegionAddress, InlineCtx, Region};
+use skyline::hooks::{getRegionAddress, A64HookFunction, A64InlineHook, InlineCtx, Region};
+use skyline::libc::c_void;
 use skyline::nn;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -79,6 +81,9 @@ static SETTINGS: AtomicU32 = AtomicU32::new(0);
 /// a kept popup shows it; cleared when the player leaves or a new search
 /// starts).
 static NOTICE_SHOWN: AtomicBool = AtomicBool::new(false);
+/// Something can end a lobby (the choice or the search hook is in); without
+/// either the notice is shown every time.
+static NOTICE_ONCE: AtomicBool = AtomicBool::new(false);
 /// `Change::code` of the kept-rematch popup on screen whose notice is shown
 /// with the question; 0 otherwise. Set and read on the UI thread.
 static COMBINE: AtomicU32 = AtomicU32::new(0);
@@ -142,8 +147,7 @@ fn shown_name(shown: u32) -> &'static str {
 /// Eden-only: replaces the ordinary record with the forced Elite Smash one,
 /// as if the fighter had just entered or left Elite Smash.
 #[cfg(feature = "diag")]
-#[skyline::hook(offset = model::SELECT_OFFSET, inline)]
-unsafe fn popup_select(ctx: &mut InlineCtx) {
+unsafe extern "C" fn popup_select(ctx: &mut InlineCtx) {
     let Some(change) = settings().force else {
         return;
     };
@@ -184,14 +188,13 @@ unsafe fn log_descriptor(stage: &str, d: u64) {
 /// The parsed popup, before it is shown. For an Elite Smash change, parses
 /// the ordinary (rematch) record into the same descriptor with the game's own
 /// parser, then puts the Elite Smash text back.
-#[skyline::hook(offset = model::PARSED_OFFSET, inline)]
-unsafe fn popup_parsed(ctx: &mut InlineCtx) {
+unsafe extern "C" fn popup_parsed(ctx: &mut InlineCtx) {
     let record = ctx.registers[20].x();
     let descriptor = read_u64(ctx.registers[19].x() + 0x10);
     #[cfg(feature = "diag")]
     log_descriptor("parsed", descriptor);
     let settings = settings();
-    let notice_shown = NOTICE_SHOWN.load(Ordering::Acquire);
+    let notice_shown = NOTICE_ONCE.load(Ordering::Acquire) && NOTICE_SHOWN.load(Ordering::Acquire);
     match model::plan(record, settings.retain, settings.body, notice_shown) {
         Plan::Keep => {
             COMBINE.store(0, Ordering::Release);
@@ -261,8 +264,7 @@ unsafe fn popup_parsed(ctx: &mut InlineCtx) {
 }
 
 /// The popup's completion (read-only): which button was chosen.
-#[skyline::hook(offset = model::CHOICE_OFFSET, inline)]
-unsafe fn popup_choice(ctx: &mut InlineCtx) {
+unsafe extern "C" fn popup_choice(ctx: &mut InlineCtx) {
     let button = read_u32(ctx.registers[8].x() + 0x118);
     let shown = SHOWN.swap(0, Ordering::AcqRel);
     COMBINE.store(0, Ordering::Release);
@@ -448,8 +450,7 @@ static CLASSIFY_NEXT: AtomicU32 = AtomicU32::new(0);
 /// Eden-only: the Elite Smash compare (threshold w0 vs rating w19, fighter
 /// x20). Logs each new input once and applies the `threshold=` override.
 #[cfg(feature = "diag")]
-#[skyline::hook(offset = model::CLASSIFY_OFFSET, inline)]
-unsafe fn classify(ctx: &mut InlineCtx) {
+unsafe extern "C" fn classify(ctx: &mut InlineCtx) {
     let native = ctx.registers[0].w();
     let rating = ctx.registers[19].w();
     let fighter = ctx.registers[20].x();
@@ -477,8 +478,7 @@ unsafe fn classify(ctx: &mut InlineCtx) {
 /// A new search starts (not a rematch): a new lobby, so the next Elite Smash
 /// change shows its notice. Reads registers only; diagnostic builds also log
 /// the Elite Smash search delay (parameter 1199, seconds) and the mode.
-#[skyline::hook(offset = model::SEARCH_DELAY_OFFSET, inline)]
-unsafe fn search_setup(ctx: &mut InlineCtx) {
+unsafe extern "C" fn search_setup(ctx: &mut InlineCtx) {
     NOTICE_SHOWN.store(false, Ordering::Release);
     #[cfg(feature = "diag")]
     push_event(format_args!(
@@ -492,8 +492,7 @@ unsafe fn search_setup(ctx: &mut InlineCtx) {
 
 /// Eden-only: logs the "Elite Smash enabled" parameter when it changes.
 #[cfg(feature = "diag")]
-#[skyline::hook(offset = model::VIP_ENABLED_OFFSET, inline)]
-unsafe fn vip_enabled(ctx: &mut InlineCtx) {
+unsafe extern "C" fn vip_enabled(ctx: &mut InlineCtx) {
     static LAST: AtomicU32 = AtomicU32::new(u32::MAX);
     let value = ctx.registers[8].w();
     if LAST.swap(value, Ordering::Relaxed) != value {
@@ -549,10 +548,25 @@ fn reload_settings() {
     }
 }
 
-extern "C" fn writer_main(_: *mut skyline::libc::c_void) {
+/// Diagnostics: the stand-in hooks' hits, when a popup or a search moved them.
+#[cfg(feature = "diag")]
+fn log_foreign_hits(seen: &mut [u32; 3]) {
+    let hits: [u32; 4] = core::array::from_fn(|i| FOREIGN_HITS[i].load(Ordering::Relaxed));
+    if hits[..3] != seen[..] {
+        seen.copy_from_slice(&hits[..3]);
+        push_event(format_args!(
+            "diag foreign_hits parsed={} choice={} search={} lookup={}",
+            hits[0], hits[1], hits[2], hits[3]
+        ));
+    }
+}
+
+extern "C" fn writer_main(_: *mut c_void) {
     let mut tail = 0;
     #[cfg(feature = "diag")]
     let mut round = 0u32;
+    #[cfg(feature = "diag")]
+    let mut foreign = [0u32; 3];
     loop {
         unsafe {
             nn::os::SleepThread(nn::TimeSpan {
@@ -564,6 +578,7 @@ extern "C" fn writer_main(_: *mut skyline::libc::c_void) {
             round = round.wrapping_add(1);
             if round.is_multiple_of(10) {
                 reload_settings();
+                log_foreign_hits(&mut foreign);
             }
         }
         drain(&mut tail);
@@ -591,13 +606,312 @@ fn start_writer() -> bool {
     }
 }
 
-unsafe fn guard_matches(site: &Site) -> bool {
-    let base = getRegionAddress(Region::Text) as usize;
-    let end = getRegionAddress(Region::Rodata) as usize;
-    let address = base + site.offset;
-    address.is_multiple_of(4)
-        && address + site.guard.len() <= end
-        && core::slice::from_raw_parts(address as *const u8, site.guard.len()) == site.guard
+/// Where an inline hook goes when another plugin's far jump holds its site:
+/// Skyline hooks the stub's `nop`s (all it relocates there), then the stub
+/// jumps on to the other plugin's handler through x17, as that far jump did;
+/// the handler runs the instructions its jump replaced.
+struct ChainStub {
+    code: unsafe extern "C" fn(),
+    target: &'static AtomicU64,
+}
+
+macro_rules! chain_stub {
+    ($stub:ident, $target:ident) => {
+        static $target: AtomicU64 = AtomicU64::new(0);
+        extern "C" {
+            fn $stub();
+        }
+        core::arch::global_asm!(
+            ".pushsection .text.elite_rematch_chain, \"ax\", %progbits",
+            ".balign 16",
+            concat!(".hidden ", stringify!($stub)),
+            concat!(".global ", stringify!($stub)),
+            concat!(stringify!($stub), ":"),
+            "nop",
+            "nop",
+            "nop",
+            "nop",
+            "nop",
+            "adrp x17, {target}",
+            "ldr x17, [x17, #:lo12:{target}]",
+            "br x17",
+            ".popsection",
+            target = sym $target,
+        );
+    };
+}
+
+chain_stub!(elite_rematch_chain_parsed, CHAIN_PARSED);
+chain_stub!(elite_rematch_chain_choice, CHAIN_CHOICE);
+chain_stub!(elite_rematch_chain_search, CHAIN_SEARCH);
+static PARSED_STUB: ChainStub = ChainStub {
+    code: elite_rematch_chain_parsed,
+    target: &CHAIN_PARSED,
+};
+static CHOICE_STUB: ChainStub = ChainStub {
+    code: elite_rematch_chain_choice,
+    target: &CHAIN_CHOICE,
+};
+static SEARCH_STUB: ChainStub = ChainStub {
+    code: elite_rematch_chain_search,
+    target: &CHAIN_SEARCH,
+};
+#[cfg(feature = "diag")]
+chain_stub!(elite_rematch_chain_select, CHAIN_SELECT);
+#[cfg(feature = "diag")]
+chain_stub!(elite_rematch_chain_classify, CHAIN_CLASSIFY);
+#[cfg(feature = "diag")]
+chain_stub!(elite_rematch_chain_vip, CHAIN_VIP);
+#[cfg(feature = "diag")]
+static SELECT_STUB: ChainStub = ChainStub {
+    code: elite_rematch_chain_select,
+    target: &CHAIN_SELECT,
+};
+#[cfg(feature = "diag")]
+static CLASSIFY_STUB: ChainStub = ChainStub {
+    code: elite_rematch_chain_classify,
+    target: &CHAIN_CLASSIFY,
+};
+#[cfg(feature = "diag")]
+static VIP_STUB: ChainStub = ChainStub {
+    code: elite_rematch_chain_vip,
+    target: &CHAIN_VIP,
+};
+
+/// One mapping as the kernel reports it (`svcQueryMemory`).
+#[repr(C)]
+#[derive(Default)]
+struct MemoryInfo {
+    address: u64,
+    size: u64,
+    kind: u32,
+    attributes: u32,
+    permission: u32,
+    ipc_references: u32,
+    device_references: u32,
+    padding: u32,
+}
+
+/// Whether `size` bytes at `address` are mapped readable and executable,
+/// checked before chaining to another plugin's handler.
+unsafe fn executable(address: u64, size: u64) -> bool {
+    let mut info = MemoryInfo::default();
+    let result: u64;
+    // QueryMemory: x0 = the MemoryInfo, x2 = the address; w0 = result.
+    core::arch::asm!(
+        "svc 0x6",
+        inout("x0") &mut info as *mut MemoryInfo as u64 => result,
+        lateout("x1") _,
+        in("x2") address,
+        clobber_abi("C"),
+        options(nostack),
+    );
+    result as u32 == 0
+        && info.permission & 5 == 5
+        && info.address <= address
+        && address
+            .checked_add(size)
+            .is_some_and(|end| end <= info.address.saturating_add(info.size))
+}
+
+/// The site's address, when its 64 bytes are in `.text`.
+unsafe fn site_address(site: &Site) -> Option<u64> {
+    let base = getRegionAddress(Region::Text) as u64;
+    let end = getRegionAddress(Region::Rodata) as u64;
+    let address = base + site.offset as u64;
+    (address.is_multiple_of(4) && address + 64 <= end).then_some(address)
+}
+
+unsafe fn words_at<const N: usize>(address: u64) -> [u32; N] {
+    core::array::from_fn(|i| read_u32(address + 4 * i as u64))
+}
+
+/// How a site ended up; the install line shows `<site>=<entry>/<outcome>`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// Hooked: Skyline wrote a near branch there.
+    Near,
+    /// Hooked: Skyline wrote a far jump there.
+    Far,
+    /// Left as it was.
+    Skipped,
+    /// The hook did not check out; the words seen before were put back.
+    Restored,
+}
+
+impl Outcome {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Near => "near",
+            Self::Far => "far",
+            Self::Skipped => "skipped",
+            Self::Restored => "restored",
+        }
+    }
+}
+
+/// The hook now at `address`: how it was written and where it goes.
+fn written(words: &[u32], address: u64) -> Option<(Outcome, u64)> {
+    if let Some(target) = model::branch(words[0], address) {
+        return Some((Outcome::Near, target));
+    }
+    match model::far_jump(words, address) {
+        Some((_, Some(target))) => Some((Outcome::Far, target)),
+        _ => None,
+    }
+}
+
+/// Puts back the words a hook at `address` replaced.
+unsafe fn restore(address: u64, before: &[u32; model::SITE_WORDS]) {
+    let _ = skyline::patching::sky_memcpy(
+        address as *const c_void,
+        before.as_ptr().cast(),
+        4 * model::hooked_words(address),
+    );
+}
+
+/// Hooks an inline site. Over another plugin's far jump the hook goes on the
+/// site's chain stub; over another plugin's near branch Skyline relocates the
+/// branch, which works only if this hook is a one-word branch too (checked).
+unsafe fn hook_inline(
+    site: &Site,
+    callback: unsafe extern "C" fn(&mut InlineCtx),
+    chain: &ChainStub,
+) -> (Entry, Outcome) {
+    let Some(address) = site_address(site) else {
+        return (Entry::Foreign, Outcome::Skipped);
+    };
+    let before = words_at::<{ model::SITE_WORDS }>(address);
+    let entry = model::entry(site, &before, address);
+    let callback = callback as *const c_void;
+    let stub = chain.code as usize as u64;
+    match entry {
+        Entry::Foreign => return (entry, Outcome::Skipped),
+        Entry::Chain(target) => {
+            if !executable(target, 4) {
+                return (entry, Outcome::Skipped);
+            }
+            chain.target.store(target, Ordering::Release);
+            A64InlineHook(stub as *const c_void, callback);
+            if written(&words_at::<5>(stub), stub).is_none() {
+                return (entry, Outcome::Skipped);
+            }
+            A64HookFunction(
+                address as *const c_void,
+                stub as *const c_void,
+                core::ptr::null_mut(),
+            );
+        }
+        Entry::Stock | Entry::Branch(_) => A64InlineHook(address as *const c_void, callback),
+    }
+    let after = words_at::<{ model::SITE_WORDS }>(address);
+    let replaced = model::hooked_words(address);
+    let hooked = match (entry, written(&after, address)) {
+        (Entry::Stock, Some((outcome, _))) => Some(outcome),
+        (Entry::Chain(_), Some((outcome, to))) if to == stub => Some(outcome),
+        // The other plugin's handler returns past its one-word branch.
+        (Entry::Branch(theirs), Some((Outcome::Near, to)))
+            if to != theirs && after[1..replaced] == before[1..replaced] =>
+        {
+            Some(Outcome::Near)
+        }
+        _ => None,
+    };
+    match hooked {
+        Some(outcome) => (entry, outcome),
+        None => {
+            restore(address, &before);
+            (entry, Outcome::Restored)
+        }
+    }
+}
+
+/// Hooks the message lookup. Over another plugin's far jump its handler
+/// becomes this hook's original, so both run; a near branch is left alone
+/// (its handler returns past one word, inside this hook's far jump).
+unsafe fn hook_lookup() -> (Entry, Outcome) {
+    let site = &model::MESSAGE_LOOKUP;
+    let Some(address) = site_address(site) else {
+        return (Entry::Foreign, Outcome::Skipped);
+    };
+    let before = words_at::<{ model::SITE_WORDS }>(address);
+    let entry = model::entry(site, &before, address);
+    let replacement = message_lookup as *const c_void;
+    match entry {
+        Entry::Stock => {
+            skyline::install_hook!(message_lookup);
+        }
+        Entry::Chain(target) if target != replacement as u64 && executable(target, 4) => {
+            let _ = message_lookup_skyline_internal_original_fn.set(target);
+            A64HookFunction(address as *const c_void, replacement, core::ptr::null_mut());
+        }
+        _ => return (entry, Outcome::Skipped),
+    }
+    let after = words_at::<{ model::SITE_WORDS }>(address);
+    match written(&after, address) {
+        Some((outcome, to)) if to == replacement as u64 => (entry, outcome),
+        _ => {
+            restore(address, &before);
+            (entry, Outcome::Restored)
+        }
+    }
+}
+
+/// Adds `<site>=<entry>/<outcome>` to the install line; whether it is hooked.
+fn note(report: &mut Line<512>, site: &Site, (entry, outcome): (Entry, Outcome)) -> bool {
+    let _ = write!(report, " {}={}/{}", site.name, entry.name(), outcome.name());
+    matches!(outcome, Outcome::Near | Outcome::Far)
+}
+
+/// Eden-only (`foreign=1`): hits on the stand-ins for another plugin's hooks
+/// on the release sites (parsed, choice, search, lookup).
+#[cfg(feature = "diag")]
+static FOREIGN_HITS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+
+#[cfg(feature = "diag")]
+macro_rules! foreign_inline {
+    ($name:ident, $index:expr) => {
+        unsafe extern "C" fn $name(_: &mut InlineCtx) {
+            FOREIGN_HITS[$index].fetch_add(1, Ordering::Relaxed);
+        }
+    };
+}
+
+#[cfg(feature = "diag")]
+foreign_inline!(foreign_parsed, 0);
+#[cfg(feature = "diag")]
+foreign_inline!(foreign_choice, 1);
+#[cfg(feature = "diag")]
+foreign_inline!(foreign_search, 2);
+
+#[cfg(feature = "diag")]
+#[skyline::hook(offset = model::MESSAGE_LOOKUP_OFFSET)]
+unsafe fn foreign_lookup(manager: u64, label: *const u8) -> *const u16 {
+    FOREIGN_HITS[3].fetch_add(1, Ordering::Relaxed);
+    call_original!(manager, label)
+}
+
+/// Eden-only: hooks each release site as a plugin loaded before this one
+/// would (plain Skyline hooks), so the install below meets those hooks.
+#[cfg(feature = "diag")]
+unsafe fn hook_as_another_plugin() {
+    let text = getRegionAddress(Region::Text) as usize;
+    let inline: [(usize, unsafe extern "C" fn(&mut InlineCtx)); 3] = [
+        (model::PARSED_OFFSET, foreign_parsed),
+        (model::CHOICE_OFFSET, foreign_choice),
+        (model::SEARCH_DELAY_OFFSET, foreign_search),
+    ];
+    for (offset, callback) in inline {
+        A64InlineHook((text + offset) as *const c_void, callback as *const c_void);
+    }
+    skyline::install_hook!(foreign_lookup);
+}
+
+#[cfg(feature = "diag")]
+fn read_foreign() -> bool {
+    let mut buf = [0u8; 256];
+    let len = read_diag(&mut buf);
+    model::parse_foreign(&buf[..len])
 }
 
 fn version_is_supported() -> bool {
@@ -608,7 +922,7 @@ fn version_is_supported() -> bool {
 }
 
 /// Appends the install line to `events.log` and the Skyline log.
-fn report_install(report: &mut Line<256>) {
+fn report_install(report: &mut Line<512>) {
     let _ = write!(
         report,
         " heap_allocations={}",
@@ -626,7 +940,7 @@ fn report_install(report: &mut Line<256>) {
 
 #[skyline::main(name = "elite-rematch")]
 pub fn main() {
-    let mut report = Line::<256>::new();
+    let mut report = Line::<512>::new();
     let _ = write!(
         report,
         "{} plugin=elite-rematch/{}",
@@ -637,31 +951,6 @@ pub fn main() {
         let _ = write!(report, " result=unsupported_version");
         report_install(&mut report);
         return;
-    }
-    let sites: &[&Site] = if cfg!(feature = "diag") {
-        &[
-            &model::SELECT,
-            &model::PARSED,
-            &model::CHOICE,
-            &model::MESSAGE_LOOKUP,
-            &model::CLASSIFY,
-            &model::VIP_ENABLED,
-            &model::SEARCH_DELAY,
-        ]
-    } else {
-        &[
-            &model::PARSED,
-            &model::CHOICE,
-            &model::MESSAGE_LOOKUP,
-            &model::SEARCH_DELAY,
-        ]
-    };
-    for site in sites {
-        if !unsafe { guard_matches(site) } {
-            let _ = write!(report, " result=guard_mismatch site={}", site.name);
-            report_install(&mut report);
-            return;
-        }
     }
     TEXT_BASE.store(
         unsafe { getRegionAddress(Region::Text) as u64 },
@@ -682,13 +971,41 @@ pub fn main() {
             threshold.map_or(-1, i64::from)
         );
     }
-    skyline::install_hooks!(popup_parsed, popup_choice, message_lookup, search_setup);
     #[cfg(feature = "diag")]
-    skyline::install_hooks!(popup_select, classify, vip_enabled);
-    let _ = write!(report, " result=installed hooks=");
-    for (i, site) in sites.iter().enumerate() {
-        let _ = write!(report, "{}{}", if i > 0 { "," } else { "" }, site.name);
+    if read_foreign() {
+        unsafe { hook_as_another_plugin() };
+        let _ = write!(report, " diag foreign=1");
     }
+    // Without the popup hook nothing else is needed.
+    let parsed = unsafe { hook_inline(&model::PARSED, popup_parsed, &PARSED_STUB) };
+    if !note(&mut report, &model::PARSED, parsed) {
+        let _ = write!(report, " result=not_installed");
+        report_install(&mut report);
+        return;
+    }
+    let choice = unsafe { hook_inline(&model::CHOICE, popup_choice, &CHOICE_STUB) };
+    let choice = note(&mut report, &model::CHOICE, choice);
+    let search = unsafe { hook_inline(&model::SEARCH_DELAY, search_setup, &SEARCH_STUB) };
+    let search = note(&mut report, &model::SEARCH_DELAY, search);
+    NOTICE_ONCE.store(choice || search, Ordering::Release);
+    // Without it the notice is shown alone, still with the rematch buttons.
+    note(&mut report, &model::MESSAGE_LOOKUP, unsafe {
+        hook_lookup()
+    });
+    #[cfg(feature = "diag")]
+    {
+        let sites: [(&Site, unsafe extern "C" fn(&mut InlineCtx), &ChainStub); 3] = [
+            (&model::SELECT, popup_select, &SELECT_STUB),
+            (&model::CLASSIFY, classify, &CLASSIFY_STUB),
+            (&model::VIP_ENABLED, vip_enabled, &VIP_STUB),
+        ];
+        for (site, callback, stub) in sites {
+            note(&mut report, site, unsafe {
+                hook_inline(site, callback, stub)
+            });
+        }
+    }
+    let _ = write!(report, " result=installed");
     report_install(&mut report);
     if !start_writer() {
         report.clear();

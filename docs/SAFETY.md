@@ -121,6 +121,36 @@ answer but Yes starts over. Release build (sha256 a85435fc...) in Eden,
 "Rematch?"; leaving, "notice + Rematch?" then "Rematch?"; all rematches
 played to the end, no desync.
 
+## Other plugins on the same sites (0.2.0, 2026-10-30)
+
+Each site is read before it is hooked (`model::entry`):
+
+- the 13.0.5 instructions: hooked as usual;
+- another plugin's Skyline far jump: the plugin chains onto it. The message
+  lookup calls that plugin's hook as its original; an inline hook goes on a
+  small stub that then jumps to that plugin's handler. Both hooks run, and
+  the jump's address word is never relocated as code;
+- another plugin's one-word branch: Skyline relocates it, and this hook must
+  come out as a one-word branch too, or the site is put back as it was;
+- other plugins' hooks further on in the 64 checked bytes are accepted;
+  anything else leaves that one site alone.
+
+Only the popup hook is required. Without the message lookup the notice shows
+alone, still with No and Yes; without both the choice and the search hook it
+shows on every popup.
+
+Eden, offline, with the 14 other plugins on the test Switch's card
+(arcropolis, css_preserve, elite_stages_counterpick, gsp_visualizer,
+imgui_smash, nro_hook, param_hook, smash_gamepad_overlay,
+smash_replay_to_mp4, ssbu_desync_detector, ssbu_online_deluxe_rewrite,
+ssbu_refresh_clock, ssbu_shaderdb_probe, training_modpack):
+
+- 22:16Z: every site stock and hooked (Skyline wrote a one-word branch for
+  the inline hooks, a far jump for the lookup); boot and main menu normal.
+- 22:19Z, diagnostic build hooking each site first as another plugin would:
+  `branch/near` on the three inline sites, `chain/far` on the lookup; the
+  menu text, which reaches the game only through the other hook, was normal.
+
 ## Not verified yet
 
 - The Switch, and Nintendo's servers.

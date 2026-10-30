@@ -27,6 +27,8 @@ plugin; both choose Yes and meet in the rematch room.*
   rating or network changes. Tested in Eden in all four Elite / non-Elite
   combinations, rematches played to the end, no desync
   ([docs/SAFETY.md](docs/SAFETY.md)).
+- Plays well with other plugins: where another plugin already hooks the same
+  spot, it chains onto that hook instead of replacing it, so both work.
 
 ## Install
 
