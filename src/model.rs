@@ -186,6 +186,32 @@ impl Settings {
         body: Body::Elite,
     };
 
+    /// One word, so the hooks can read settings the writer thread reloads.
+    pub fn to_bits(self) -> u32 {
+        let force = match self.force {
+            None => 0,
+            Some(Change::Entered) => 1,
+            Some(Change::Left) => 2,
+        };
+        force | (u32::from(self.retain) << 2) | (u32::from(self.body == Body::Rematch) << 3)
+    }
+
+    pub fn from_bits(bits: u32) -> Self {
+        Self {
+            force: match bits & 3 {
+                1 => Some(Change::Entered),
+                2 => Some(Change::Left),
+                _ => None,
+            },
+            retain: bits & 4 != 0,
+            body: if bits & 8 != 0 {
+                Body::Rematch
+            } else {
+                Body::Elite
+            },
+        }
+    }
+
     pub fn parse(text: &[u8]) -> Self {
         let mut settings = Self::DEFAULT;
         for line in text.split(|b| *b == b'\n') {
@@ -334,6 +360,22 @@ mod tests {
             "the last line wins"
         );
         assert_eq!(Settings::parse(b"force=sideways"), Settings::DEFAULT);
+    }
+
+    #[test]
+    fn settings_round_trip_through_bits() {
+        for force in [None, Some(Change::Entered), Some(Change::Left)] {
+            for retain in [false, true] {
+                for body in [Body::Elite, Body::Rematch] {
+                    let s = Settings {
+                        force,
+                        retain,
+                        body,
+                    };
+                    assert_eq!(Settings::from_bits(s.to_bits()), s);
+                }
+            }
+        }
     }
 
     #[test]

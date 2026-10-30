@@ -73,8 +73,8 @@ static TEXT_BASE: AtomicU64 = AtomicU64::new(0);
 /// The popup on screen: 0 ordinary, 1/2 entered/left as the game shows it,
 /// 3/4 entered/left with the rematch kept.
 static SHOWN: AtomicU32 = AtomicU32::new(0);
-/// Written once in `main` before any hook is installed.
-static SETTINGS: Owned<Settings> = Owned(UnsafeCell::new(Settings::DEFAULT));
+/// `Settings::to_bits`; diagnostic builds reload it from `diag.txt`.
+static SETTINGS: AtomicU32 = AtomicU32::new(0);
 
 /// The writer thread's object and stack, static so no heap is involved.
 #[repr(C, align(4096))]
@@ -100,8 +100,7 @@ unsafe fn read_u64(address: u64) -> u64 {
 }
 
 fn settings() -> Settings {
-    // SAFETY: only written in `main` before the hooks exist.
-    unsafe { *SETTINGS.0.get() }
+    Settings::from_bits(SETTINGS.load(Ordering::Acquire))
 }
 
 fn push_event(args: core::fmt::Arguments) {
@@ -360,14 +359,38 @@ fn drain(tail: &mut u64) {
     }
 }
 
+/// Diagnostics: picks up edits of `diag.txt` between matches.
+#[cfg(feature = "diag")]
+fn reload_settings() {
+    let loaded = read_settings();
+    let bits = loaded.to_bits();
+    if SETTINGS.swap(bits, Ordering::AcqRel) != bits {
+        push_event(format_args!(
+            "diag settings force={} retain={} body={}",
+            loaded.force.map_or("none", Change::name),
+            u8::from(loaded.retain),
+            loaded.body.name()
+        ));
+    }
+}
+
 extern "C" fn writer_main(_: *mut skyline::libc::c_void) {
     let mut tail = 0;
+    #[cfg(feature = "diag")]
+    let mut round = 0u32;
     loop {
         unsafe {
             nn::os::SleepThread(nn::TimeSpan {
                 nanoseconds: 200_000_000,
             })
         };
+        #[cfg(feature = "diag")]
+        {
+            round = round.wrapping_add(1);
+            if round.is_multiple_of(10) {
+                reload_settings();
+            }
+        }
         drain(&mut tail);
     }
 }
@@ -456,11 +479,11 @@ pub fn main() {
         unsafe { getRegionAddress(Region::Text) as u64 },
         Ordering::Relaxed,
     );
+    SETTINGS.store(Settings::DEFAULT.to_bits(), Ordering::Release);
     #[cfg(feature = "diag")]
     {
         let loaded = read_settings();
-        // SAFETY: no hook is installed yet.
-        unsafe { *SETTINGS.0.get() = loaded };
+        SETTINGS.store(loaded.to_bits(), Ordering::Release);
         let _ = write!(
             report,
             " diag force={} retain={} body={}",
