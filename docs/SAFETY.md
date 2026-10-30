@@ -92,8 +92,29 @@ record.
   a match, a rematch (Yes on both), then No on both; the plugin left both
   ordinary popups as they were, and the detector saw no mismatch.
 
+## Real Elite Smash changes (Eden, 2026-10-30, 19:08-19:56Z)
+
+Same-PC pair on one host, the Eden agent's rating server (v8) with seeded
+Lucario ratings, no forced popup. The game's own values, logged by the
+diagnostic build: Elite Smash at rating >= 1642, Elite searches widen to
+non-Elite players after 120 s. The modded console ran this plugin; the
+vanilla console ran no elite-rematch plugin (desync detector only). The
+loser ran off the stage once at the start; each run was a match, Yes on
+both, the full rematch, No on both.
+
+| Run | Vanilla | Modded | Popup on the modded console | Rematch | Detector |
+|---|---|---|---|---|---|
+| 1 | non-Elite (1500), wins | Elite (1645), loses: bumped out | "The Elite Smash battle has been canceled. Rematch?" | played to the end | no mismatch |
+| 2 | Elite (1800), wins | Elite (1645), loses: bumped out | same | played to the end | no mismatch |
+| 3 | non-Elite (1500), loses | non-Elite (1641), wins: enters | "You can now participate in Elite Smash. Rematch?" | played to the end | no mismatch |
+| 4 | Elite (1800), loses | non-Elite (1641), wins: enters | same | played to the end | no mismatch |
+
+In runs 4 and 1 (repeated) the Elite console searched alone first and was
+paired with the non-Elite one when its search widened (about 124 s), as on
+Nintendo's servers. The popup after the rematch shows the notice again: the
+rematch stays in the session of the first match, so the game compares
+against that tier.
+
 ## Not verified yet
 
-- A real tier change (needs GSP crossing the threshold) and the mode switch
-  after the last rematch: Eden tests force only the popup record.
-- The Switch.
+- The Switch, and Nintendo's servers.

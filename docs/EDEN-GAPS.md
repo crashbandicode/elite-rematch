@@ -1,5 +1,14 @@
 # Eden LAN Online: what Elite Smash testing needs (2026-10-30)
 
+**Status 19:56Z:** the Eden agent's rating runtime (v8) provides items 1, 2
+and 4 below and real Elite Smash changes were tested with it (see
+`SAFETY.md`). Seeds need an existing stored report for the fighter. Open:
+with both consoles searching at the same moment, a Quickplay search joined
+an Elite Smash session at once (2 s, run e08); on Nintendo's servers an
+Elite player meets non-Elite players only after waiting. Measured in Eden
+by the diagnostic build: Elite threshold 1642, Elite search widening after
+120 s.
+
 For the Eden agent. The `elite-rematch` plugin keeps the Quickplay rematch
 when a player enters or leaves Elite Smash. Testing it for real needs a GSP
 that persists and can cross the Elite Smash threshold. No change to the

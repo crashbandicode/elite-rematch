@@ -29,9 +29,11 @@ rematch; No leaves, and the game then moves you into or out of Elite Smash
 as usual.
 
 UI only: no random draws, no match, rating or network changes
-([docs/SAFETY.md](docs/SAFETY.md)). The opponent does not need the plugin:
-in Eden a console without it rematched twice with one using it, and the
-desync detector saw no mismatch on either.
+([docs/SAFETY.md](docs/SAFETY.md)). The opponent does not need the plugin.
+In Eden (2026-10-30) a console with the plugin really entered and left Elite
+Smash against a console without it, Elite and non-Elite, in all four
+combinations; each time both chose Yes, played the rematch to the end, and
+the desync detector saw no mismatch on either console.
 
 ## Install
 
