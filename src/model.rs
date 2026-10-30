@@ -88,6 +88,63 @@ pub const MESSAGE_LOOKUP: Site = Site {
     ],
 };
 
+/// Elite Smash classifier `.17049d0` (diagnostics only): at `.1704a98`
+/// (`cmp w0, w19`) w0 = the threshold (parameter 1201), w19 = the fighter's
+/// cached rating, x20 = the fighter's Hash40; the result is rating >=
+/// threshold. Overriding w0 there makes a real GSP update cross a chosen
+/// threshold in Eden, which has no rating server.
+pub const CLASSIFY_OFFSET: usize = 0x1704a98;
+pub const CLASSIFY: Site = Site {
+    name: "classify",
+    offset: CLASSIFY_OFFSET,
+    guard: [
+        0x1f, 0x00, 0x13, 0x6b, 0xe0, 0x87, 0x9f, 0x1a, 0xf4, 0xff, 0xff, 0x17, 0xeb, 0xf6, 0x8a,
+        0x94, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf9, 0x0f, 0x1b, 0xf8, 0xf8, 0x5f,
+        0x01, 0xa9, 0xf6, 0x57, 0x02, 0xa9, 0xf4, 0x4f, 0x03, 0xa9, 0xfd, 0x7b, 0x04, 0xa9, 0xfd,
+        0x03, 0x01, 0x91, 0x08, 0xde, 0x01, 0x90, 0x08, 0x2d, 0x46, 0xf9, 0x08, 0x05, 0x40, 0xf9,
+        0xf3, 0x03, 0x00, 0xaa,
+    ],
+};
+
+/// The classifier's "Elite Smash enabled" check (parameter 9010 == 1) at
+/// `.1704a04` (`cmp w8, #1`), diagnostics only: logged, never changed.
+pub const VIP_ENABLED_OFFSET: usize = 0x1704a04;
+pub const VIP_ENABLED: Site = Site {
+    name: "vip_enabled",
+    offset: VIP_ENABLED_OFFSET,
+    guard: [
+        0x1f, 0x05, 0x00, 0x71, 0x21, 0x03, 0x00, 0x54, 0x48, 0xe1, 0x01, 0xf0, 0x08, 0x99, 0x43,
+        0xf9, 0x08, 0x05, 0x40, 0xf9, 0x00, 0xb5, 0x40, 0xf9, 0xe1, 0x03, 0x14, 0xaa, 0x14, 0x7e,
+        0x6d, 0x94, 0xe8, 0x03, 0x00, 0x2a, 0xe0, 0x03, 0x1f, 0x2a, 0x28, 0x02, 0xf8, 0x37, 0xe9,
+        0x03, 0x28, 0x2a, 0x3f, 0x1d, 0x00, 0x72, 0xc0, 0x01, 0x00, 0x54, 0x08, 0x1d, 0x00, 0x12,
+        0x1f, 0x8d, 0x01, 0x71,
+    ],
+};
+
+/// `threshold=<decimal>` in `diag.txt` (the last such line wins);
+/// `threshold=native` or none keeps the game's parameter.
+pub fn parse_threshold(text: &[u8]) -> Option<u32> {
+    let mut threshold = None;
+    for line in text.split(|b| *b == b'\n') {
+        let Some(eq) = line.iter().position(|b| *b == b'=') else {
+            continue;
+        };
+        if trim(&line[..eq]) != b"threshold" {
+            continue;
+        }
+        let value = trim(&line[eq + 1..]);
+        threshold = if value == b"native" {
+            None
+        } else {
+            core::str::from_utf8(value)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(threshold)
+        };
+    }
+    threshold
+}
+
 /// Message labels of the three popup bodies (NUL-terminated, as the game
 /// passes them to the lookup).
 pub const LABEL_REMATCH: &[u8] = b"pop_result_battle_again\0";
@@ -517,6 +574,23 @@ mod tests {
             "the last line wins"
         );
         assert_eq!(Settings::parse(b"force=sideways"), Settings::DEFAULT);
+    }
+
+    #[test]
+    fn threshold_parse() {
+        assert_eq!(parse_threshold(b""), None);
+        assert_eq!(parse_threshold(b"threshold=9000000\n"), Some(9_000_000));
+        assert_eq!(parse_threshold(b"threshold = 0"), Some(0));
+        assert_eq!(parse_threshold(b"retain=0\nforce=left"), None);
+        assert_eq!(parse_threshold(b"threshold= 12 \r\n"), Some(12));
+        assert_eq!(parse_threshold(b"threshold=5\nthreshold=native"), None);
+        assert_eq!(parse_threshold(b"threshold=5\nthreshold=junk"), Some(5));
+    }
+
+    #[test]
+    fn diag_guards_start_with_the_hooked_instruction() {
+        assert_eq!(CLASSIFY.guard[..4], [0x1f, 0x00, 0x13, 0x6b]); // cmp w0, w19
+        assert_eq!(VIP_ENABLED.guard[..4], [0x1f, 0x05, 0x00, 0x71]); // cmp w8, #1
     }
 
     #[test]

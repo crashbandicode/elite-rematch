@@ -381,26 +381,92 @@ fn append_log(bytes: &[u8]) {
     }
 }
 
+/// `diag.txt` into `buf`; the bytes read (0 when it is missing).
 #[cfg(feature = "diag")]
-fn read_settings() -> Settings {
+fn read_diag(buf: &mut [u8; 256]) -> usize {
     let mut file = path(format_args!("{DATA_DIR}/diag.txt"));
     let Some(file) = file.with_nul() else {
-        return Settings::DEFAULT;
+        return 0;
     };
-    let mut buf = [0u8; 256];
     let mut read = 0u64;
     unsafe {
         let mut handle = nn::fs::FileHandle { handle: 0 };
         if nn::fs::OpenFile(&mut handle, file.as_ptr(), OPEN_READ) != 0 {
-            return Settings::DEFAULT;
+            return 0;
         }
         let ok = nn::fs::ReadFile1(&mut read, handle, 0, buf.as_mut_ptr(), buf.len() as u64) == 0;
         nn::fs::CloseFile(handle);
         if !ok {
-            return Settings::DEFAULT;
+            return 0;
         }
     }
-    Settings::parse(&buf[..(read as usize).min(buf.len())])
+    (read as usize).min(buf.len())
+}
+
+/// Settings and threshold override from `diag.txt`.
+#[cfg(feature = "diag")]
+fn read_settings() -> (Settings, Option<u32>) {
+    let mut buf = [0u8; 256];
+    let len = read_diag(&mut buf);
+    (
+        Settings::parse(&buf[..len]),
+        model::parse_threshold(&buf[..len]),
+    )
+}
+
+/// 0 = the game's threshold, else `1 << 32 | value`.
+#[cfg(feature = "diag")]
+static THRESHOLD: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "diag")]
+fn threshold_word(threshold: Option<u32>) -> u64 {
+    threshold.map_or(0, |t| (1 << 32) | u64::from(t))
+}
+
+/// Last classifier inputs logged, so a per-frame caller logs each state once.
+#[cfg(feature = "diag")]
+static CLASSIFY_SEEN: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+#[cfg(feature = "diag")]
+static CLASSIFY_NEXT: AtomicU32 = AtomicU32::new(0);
+
+/// Eden-only: the Elite Smash compare (threshold w0 vs rating w19, fighter
+/// x20). Logs each new input once and applies the `threshold=` override.
+#[cfg(feature = "diag")]
+#[skyline::hook(offset = model::CLASSIFY_OFFSET, inline)]
+unsafe fn classify(ctx: &mut InlineCtx) {
+    let native = ctx.registers[0].w();
+    let rating = ctx.registers[19].w();
+    let fighter = ctx.registers[20].x();
+    let word = THRESHOLD.load(Ordering::Acquire);
+    let used = if word >> 32 != 0 { word as u32 } else { native };
+    if used != native {
+        ctx.registers[0].set_w(used);
+    }
+    let key =
+        (fighter & 0xff_ffff_ffff) ^ (u64::from(rating) << 24) ^ u64::from(used).rotate_left(48);
+    if CLASSIFY_SEEN
+        .iter()
+        .any(|seen| seen.load(Ordering::Relaxed) == key)
+    {
+        return;
+    }
+    let slot = CLASSIFY_NEXT.fetch_add(1, Ordering::Relaxed) as usize % CLASSIFY_SEEN.len();
+    CLASSIFY_SEEN[slot].store(key, Ordering::Relaxed);
+    push_event(format_args!(
+        "diag classify fighter={fighter:#x} rating={rating} threshold={native} used={used} elite={}",
+        u8::from(rating >= used)
+    ));
+}
+
+/// Eden-only: logs the "Elite Smash enabled" parameter when it changes.
+#[cfg(feature = "diag")]
+#[skyline::hook(offset = model::VIP_ENABLED_OFFSET, inline)]
+unsafe fn vip_enabled(ctx: &mut InlineCtx) {
+    static LAST: AtomicU32 = AtomicU32::new(u32::MAX);
+    let value = ctx.registers[8].w();
+    if LAST.swap(value, Ordering::Relaxed) != value {
+        push_event(format_args!("diag vip_enabled param9010={value}"));
+    }
 }
 
 /// Copies every published event after `tail` into `events.log`.
@@ -436,14 +502,17 @@ fn drain(tail: &mut u64) {
 /// Diagnostics: picks up edits of `diag.txt` between matches.
 #[cfg(feature = "diag")]
 fn reload_settings() {
-    let loaded = read_settings();
+    let (loaded, threshold) = read_settings();
     let bits = loaded.to_bits();
-    if SETTINGS.swap(bits, Ordering::AcqRel) != bits {
+    let word = threshold_word(threshold);
+    let changed = SETTINGS.swap(bits, Ordering::AcqRel) != bits;
+    if THRESHOLD.swap(word, Ordering::AcqRel) != word || changed {
         push_event(format_args!(
-            "diag settings force={} retain={} body={}",
+            "diag settings force={} retain={} body={} threshold={}",
             loaded.force.map_or("none", Change::name),
             u8::from(loaded.retain),
-            loaded.body.name()
+            loaded.body.name(),
+            threshold.map_or(-1, i64::from)
         ));
     }
 }
@@ -543,6 +612,8 @@ pub fn main() {
             &model::PARSED,
             &model::CHOICE,
             &model::MESSAGE_LOOKUP,
+            &model::CLASSIFY,
+            &model::VIP_ENABLED,
         ]
     } else {
         &[&model::PARSED, &model::CHOICE, &model::MESSAGE_LOOKUP]
@@ -561,19 +632,21 @@ pub fn main() {
     SETTINGS.store(Settings::DEFAULT.to_bits(), Ordering::Release);
     #[cfg(feature = "diag")]
     {
-        let loaded = read_settings();
+        let (loaded, threshold) = read_settings();
         SETTINGS.store(loaded.to_bits(), Ordering::Release);
+        THRESHOLD.store(threshold_word(threshold), Ordering::Release);
         let _ = write!(
             report,
-            " diag force={} retain={} body={}",
+            " diag force={} retain={} body={} threshold={}",
             loaded.force.map_or("none", Change::name),
             u8::from(loaded.retain),
-            loaded.body.name()
+            loaded.body.name(),
+            threshold.map_or(-1, i64::from)
         );
     }
     skyline::install_hooks!(popup_parsed, popup_choice, message_lookup);
     #[cfg(feature = "diag")]
-    skyline::install_hook!(popup_select);
+    skyline::install_hooks!(popup_select, classify, vip_enabled);
     let _ = write!(report, " result=installed hooks=");
     for (i, site) in sites.iter().enumerate() {
         let _ = write!(report, "{}{}", if i > 0 { "," } else { "" }, site.name);
