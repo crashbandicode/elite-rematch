@@ -1,19 +1,21 @@
-//! Switch half: version check, guarded hooks on the post-match popup (chained
-//! onto other plugins' hooks on the same sites), an event ring and a writer
-//! thread that appends `events.log`.
+//! Switch half: version check, guarded hooks on the post-match popup (shared
+//! with other plugins through inline-hook sharing v1, chained onto hooks that
+//! do not use it), an event ring and a writer thread that appends
+//! `events.log`.
 //!
 //! Hooks run on the game's UI thread and only format a line into a static
 //! ring; the writer thread does the file I/O. No heap (`heap_allocations` in
 //! the install line counts any).
 
 use crate::model::{self, descriptor, Body, Change, Entry, Line, Plan, Settings, Site};
+use crate::share;
 use core::cell::UnsafeCell;
 use core::fmt::Write as _;
 use skyline::hooks::{getRegionAddress, A64HookFunction, A64InlineHook, InlineCtx, Region};
 use skyline::libc::c_void;
 use skyline::nn;
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 const DATA_DIR: &str = "sd:/ultimate/elite-rematch";
 const EVENT_RING: usize = 16;
@@ -84,6 +86,9 @@ static NOTICE_SHOWN: AtomicBool = AtomicBool::new(false);
 /// Something can end a lobby (the choice or the search hook is in); without
 /// either the notice is shown every time.
 static NOTICE_ONCE: AtomicBool = AtomicBool::new(false);
+/// The popup hook is in. The choice and search sites may be hooked without
+/// it, for other plugins sharing them; this plugin's callbacks then do nothing.
+static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// `Change::code` of the kept-rematch popup on screen whose notice is shown
 /// with the question; 0 otherwise. Set and read on the UI thread.
 static COMBINE: AtomicU32 = AtomicU32::new(0);
@@ -265,6 +270,9 @@ unsafe extern "C" fn popup_parsed(ctx: &mut InlineCtx) {
 
 /// The popup's completion (read-only): which button was chosen.
 unsafe extern "C" fn popup_choice(ctx: &mut InlineCtx) {
+    if !ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
     let button = read_u32(ctx.registers[8].x() + 0x118);
     let shown = SHOWN.swap(0, Ordering::AcqRel);
     COMBINE.store(0, Ordering::Release);
@@ -479,6 +487,9 @@ unsafe extern "C" fn classify(ctx: &mut InlineCtx) {
 /// change shows its notice. Reads registers only; diagnostic builds also log
 /// the Elite Smash search delay (parameter 1199, seconds) and the mode.
 unsafe extern "C" fn search_setup(ctx: &mut InlineCtx) {
+    if !ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
     NOTICE_SHOWN.store(false, Ordering::Release);
     #[cfg(feature = "diag")]
     push_event(format_args!(
@@ -857,10 +868,182 @@ unsafe fn hook_lookup() -> (Entry, Outcome) {
     }
 }
 
-/// Adds `<site>=<entry>/<outcome>` to the install line; whether it is hooked.
-fn note(report: &mut Line<512>, site: &Site, (entry, outcome): (Entry, Outcome)) -> bool {
-    let _ = write!(report, " {}={}/{}", site.name, entry.name(), outcome.name());
-    matches!(outcome, Outcome::Near | Outcome::Far)
+/// What became of a site.
+#[derive(Clone, Copy)]
+enum Hooked {
+    /// This plugin hooked it.
+    Own(Entry, Outcome),
+    /// Another plugin owns it (inline-hook sharing v1) and calls this
+    /// plugin's callback from its hook.
+    Guest,
+    /// That owner turned the callback down.
+    Refused,
+}
+
+impl From<(Entry, Outcome)> for Hooked {
+    fn from((entry, outcome): (Entry, Outcome)) -> Self {
+        Self::Own(entry, outcome)
+    }
+}
+
+/// Adds `<site>=<entry>/<outcome>` (or `=guest`, `=refused`) to the install
+/// line; whether the site's callback will run.
+fn note(report: &mut Line<512>, site: &Site, hooked: Hooked) -> bool {
+    match hooked {
+        Hooked::Own(entry, outcome) => {
+            let _ = write!(report, " {}={}/{}", site.name, entry.name(), outcome.name());
+            matches!(outcome, Outcome::Near | Outcome::Far)
+        }
+        Hooked::Guest => {
+            let _ = write!(report, " {}=guest", site.name);
+            true
+        }
+        Hooked::Refused => {
+            let _ = write!(report, " {}=refused", site.name);
+            false
+        }
+    }
+}
+
+/// A release inline site under inline-hook sharing v1 (see `share`).
+struct SharedSite {
+    site: &'static Site,
+    /// `ssbu_inline_site_<offset>_v1`, NUL-terminated.
+    export: &'static [u8],
+    table: &'static share::SiteShareV1,
+    state: &'static AtomicU8,
+    /// This plugin's callback.
+    own: unsafe extern "C" fn(&mut InlineCtx),
+    /// The hook when this plugin owns the site: `own`, then every callback
+    /// other plugins registered.
+    owner: unsafe extern "C" fn(&mut InlineCtx),
+    stub: &'static ChainStub,
+}
+
+/// Exports a site's sharing table and builds its `SharedSite`.
+macro_rules! shared_site {
+    ($module:ident, $site:path, $export:ident, $own:ident, $stub:ident) => {
+        mod $module {
+            use super::*;
+
+            static GUESTS: share::Callbacks = share::Callbacks::new();
+            /// 0 until this plugin's `main` decides the site, then 1 hooked
+            /// by this plugin, 2 not.
+            static STATE: AtomicU8 = AtomicU8::new(0);
+            static TABLE: share::SiteShareV1 = share::SiteShareV1 {
+                abi_version: share::ABI_VERSION,
+                offset: $site.offset as u64,
+                register,
+            };
+
+            /// Inline-hook sharing v1 for this site (see `share`).
+            #[no_mangle]
+            pub extern "C" fn $export() -> *const share::SiteShareV1 {
+                &TABLE
+            }
+
+            /// Another plugin's callback; taken when this plugin hooks the
+            /// site (or will: a registration can come before this `main`,
+            /// and after it the site holds this plugin's hook).
+            unsafe extern "C" fn register(callback: usize) -> bool {
+                let usable = match STATE.load(Ordering::Acquire) {
+                    0 => site_usable(&$site),
+                    state => state == 1,
+                };
+                usable && GUESTS.push(callback)
+            }
+
+            unsafe extern "C" fn owner(ctx: &mut InlineCtx) {
+                $own(ctx);
+                GUESTS.for_each(|callback| {
+                    let callback: unsafe extern "C" fn(*mut InlineCtx) =
+                        core::mem::transmute(callback);
+                    callback(ctx);
+                });
+            }
+
+            pub static SHARED: SharedSite = SharedSite {
+                site: &$site,
+                export: concat!(stringify!($export), "\0").as_bytes(),
+                table: &TABLE,
+                state: &STATE,
+                own: $own,
+                owner,
+                stub: &$stub,
+            };
+        }
+    };
+}
+
+shared_site!(
+    parsed_share,
+    model::PARSED,
+    ssbu_inline_site_147fb64_v1,
+    popup_parsed,
+    PARSED_STUB
+);
+shared_site!(
+    choice_share,
+    model::CHOICE,
+    ssbu_inline_site_147f4d0_v1,
+    popup_choice,
+    CHOICE_STUB
+);
+shared_site!(
+    search_share,
+    model::SEARCH_DELAY,
+    ssbu_inline_site_168a5b8_v1,
+    search_setup,
+    SEARCH_STUB
+);
+
+/// Whether this plugin hooks `site` when it owns it: 13.0.5 and the site as
+/// `model::entry` accepts it. Other plugins' registrations ask this too,
+/// possibly before this plugin's `main`.
+fn site_usable(site: &Site) -> bool {
+    version_is_supported()
+        && unsafe { site_address(site) }.is_some_and(|address| {
+            let words = unsafe { words_at::<{ model::SITE_WORDS }>(address) };
+            model::entry(site, &words, address) != Entry::Foreign
+        })
+}
+
+/// The sharing table that whoever's export `name` resolves to first returns
+/// (0 when nothing exports it).
+fn owner_table(name: &[u8]) -> usize {
+    let mut export = 0usize;
+    unsafe { nn::ro::LookupSymbol(&mut export, name.as_ptr()) };
+    if export == 0 {
+        return 0;
+    }
+    let export: extern "C" fn() -> *const share::SiteShareV1 =
+        unsafe { core::mem::transmute(export) };
+    export() as usize
+}
+
+/// Hooks a site this plugin owns; registers this plugin's callback with
+/// another owner, which then calls it from its hook.
+unsafe fn hook_shared(shared: &SharedSite) -> Hooked {
+    let own_table = shared.table as *const share::SiteShareV1 as usize;
+    match share::role(owner_table(shared.export), own_table) {
+        share::Role::Owner => {
+            let (entry, outcome) = hook_inline(shared.site, shared.owner, shared.stub);
+            let hooked = matches!(outcome, Outcome::Near | Outcome::Far);
+            shared
+                .state
+                .store(if hooked { 1 } else { 2 }, Ordering::Release);
+            Hooked::Own(entry, outcome)
+        }
+        share::Role::Guest(table) => {
+            shared.state.store(2, Ordering::Release);
+            let api = &*(table as *const share::SiteShareV1);
+            if share::compatible(api, shared.site.offset) && (api.register)(shared.own as usize) {
+                Hooked::Guest
+            } else {
+                Hooked::Refused
+            }
+        }
+    }
 }
 
 /// Eden-only (`foreign=1`): hits on the stand-ins for another plugin's hooks
@@ -976,22 +1159,21 @@ pub fn main() {
         unsafe { hook_as_another_plugin() };
         let _ = write!(report, " diag foreign=1");
     }
-    // Without the popup hook nothing else is needed.
-    let parsed = unsafe { hook_inline(&model::PARSED, popup_parsed, &PARSED_STUB) };
-    if !note(&mut report, &model::PARSED, parsed) {
-        let _ = write!(report, " result=not_installed");
-        report_install(&mut report);
-        return;
-    }
-    let choice = unsafe { hook_inline(&model::CHOICE, popup_choice, &CHOICE_STUB) };
+    let parsed = unsafe { hook_shared(&parsed_share::SHARED) };
+    let parsed = note(&mut report, &model::PARSED, parsed);
+    ACTIVE.store(parsed, Ordering::Release);
+    // Hooked even without the popup hook, for the plugins sharing them.
+    let choice = unsafe { hook_shared(&choice_share::SHARED) };
     let choice = note(&mut report, &model::CHOICE, choice);
-    let search = unsafe { hook_inline(&model::SEARCH_DELAY, search_setup, &SEARCH_STUB) };
+    let search = unsafe { hook_shared(&search_share::SHARED) };
     let search = note(&mut report, &model::SEARCH_DELAY, search);
     NOTICE_ONCE.store(choice || search, Ordering::Release);
     // Without it the notice is shown alone, still with the rematch buttons.
-    note(&mut report, &model::MESSAGE_LOOKUP, unsafe {
-        hook_lookup()
-    });
+    if parsed {
+        note(&mut report, &model::MESSAGE_LOOKUP, unsafe {
+            hook_lookup().into()
+        });
+    }
     #[cfg(feature = "diag")]
     {
         let sites: [(&Site, unsafe extern "C" fn(&mut InlineCtx), &ChainStub); 3] = [
@@ -1001,11 +1183,15 @@ pub fn main() {
         ];
         for (site, callback, stub) in sites {
             note(&mut report, site, unsafe {
-                hook_inline(site, callback, stub)
+                hook_inline(site, callback, stub).into()
             });
         }
     }
-    let _ = write!(report, " result=installed");
+    let _ = write!(
+        report,
+        " result={}",
+        if parsed { "installed" } else { "not_installed" }
+    );
     report_install(&mut report);
     if !start_writer() {
         report.clear();

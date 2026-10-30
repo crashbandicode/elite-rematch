@@ -1,0 +1,28 @@
+[package]
+name = "share-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Eden test plugin: wants the same instruction as elite-rematch (0x147fb64) and uses inline-hook sharing v1; logs how often its callback runs"
+license = "MIT"
+
+[package.metadata.skyline]
+titleid = "01006A800016E000"
+
+[lib]
+crate-type = ["cdylib"]
+
+[target.'cfg(target_os = "switch")'.dependencies]
+skyline = "=0.6.0"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("switch"))'] }
