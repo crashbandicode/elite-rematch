@@ -24,9 +24,10 @@ can now participate in Elite Smash.") or left ("The Elite Smash battle has
 been canceled.") Elite Smash. For the two notices the plugin loads the
 "Rematch?" buttons into the popup with the game's own parser, and while that
 popup is up it answers the notice's text with the notice plus the game's
-"Rematch?" (both in the console's language). Yes is the game's normal
-rematch; No leaves, and the game then moves you into or out of Elite Smash
-as usual.
+"Rematch?" (both in the console's language). The notice shows once per
+lobby; the popups after the following rematches are the plain "Rematch?".
+Yes is the game's normal rematch; No leaves, and the game then moves you
+into or out of Elite Smash as usual.
 
 UI only: no random draws, no match, rating or network changes
 ([docs/SAFETY.md](docs/SAFETY.md)). The opponent does not need the plugin.

@@ -121,11 +121,12 @@ pub const VIP_ENABLED: Site = Site {
     ],
 };
 
-/// Matchmaking search setup (diagnostics only, read): at `.168a5b8`
-/// (`str w0, [x25, #0x8c]`) w0 = parameter 1199, the seconds an Elite Smash
-/// search waits before it is restarted with the VIP filter widened to 0..1;
-/// x25 = network context + 0x269c4, whose u32 at -4 is the search mode
-/// (1 Quickplay, 3 Elite Smash).
+/// Matchmaking search setup, read only: at `.168a5b8` (`str w0, [x25,
+/// #0x8c]`) w0 = parameter 1199, the seconds an Elite Smash search waits
+/// before it is restarted with the VIP filter widened to 0..1; x25 = network
+/// context + 0x269c4, whose u32 at -4 is the search mode (1 Quickplay, 3
+/// Elite Smash). It runs when a new search starts, not for a rematch (Eden,
+/// 2026-10-30), so the plugin uses it as the start of a new lobby.
 pub const SEARCH_DELAY_OFFSET: usize = 0x168a5b8;
 pub const SEARCH_DELAY: Site = Site {
     name: "search_delay",
@@ -324,11 +325,15 @@ pub enum Plan {
     Reparse { change: Change, keep_body: bool },
 }
 
-pub fn plan(record: u64, retain: bool, body: Body) -> Plan {
+/// `notice_shown`: the Elite Smash notice was already shown in this lobby.
+/// A rematch stays in the first match's session, so the game keeps choosing
+/// the notice after every rematch; only the first one shows it, later ones
+/// are the plain "Rematch?".
+pub fn plan(record: u64, retain: bool, body: Body, notice_shown: bool) -> Plan {
     match Change::of(record) {
         Some(change) if retain => Plan::Reparse {
             change,
-            keep_body: body != Body::Rematch,
+            keep_body: body != Body::Rematch && !notice_shown,
         },
         _ => Plan::Keep,
     }
@@ -494,30 +499,52 @@ mod tests {
 
     #[test]
     fn only_elite_records_are_reparsed() {
-        assert_eq!(plan(POPUP_ORDINARY, true, Body::Elite), Plan::Keep);
-        assert_eq!(plan(0x58ff_ff1b_4bcc_ae33, true, Body::Elite), Plan::Keep);
+        assert_eq!(plan(POPUP_ORDINARY, true, Body::Elite, false), Plan::Keep);
         assert_eq!(
-            plan(POPUP_ENTERED, true, Body::Elite),
+            plan(0x58ff_ff1b_4bcc_ae33, true, Body::Elite, false),
+            Plan::Keep
+        );
+        assert_eq!(
+            plan(POPUP_ENTERED, true, Body::Elite, false),
             Plan::Reparse {
                 change: Change::Entered,
                 keep_body: true
             }
         );
         assert_eq!(
-            plan(POPUP_LEFT, true, Body::Rematch),
+            plan(POPUP_LEFT, true, Body::Rematch, false),
             Plan::Reparse {
                 change: Change::Left,
                 keep_body: false
             }
         );
-        assert_eq!(plan(POPUP_LEFT, false, Body::Elite), Plan::Keep);
+        assert_eq!(plan(POPUP_LEFT, false, Body::Elite, false), Plan::Keep);
         assert_eq!(
-            plan(POPUP_ENTERED, true, Body::Both),
+            plan(POPUP_ENTERED, true, Body::Both, false),
             Plan::Reparse {
                 change: Change::Entered,
                 keep_body: true
             }
         );
+    }
+
+    #[test]
+    fn notice_shows_once_then_plain_rematch() {
+        for body in [Body::Both, Body::Elite] {
+            for record in [POPUP_ENTERED, POPUP_LEFT] {
+                let change = Change::of(record).unwrap();
+                assert_eq!(
+                    plan(record, true, body, true),
+                    Plan::Reparse {
+                        change,
+                        keep_body: false
+                    },
+                    "later popups keep the rematch without the notice"
+                );
+            }
+        }
+        assert_eq!(plan(POPUP_ORDINARY, true, Body::Both, true), Plan::Keep);
+        assert_eq!(plan(POPUP_ENTERED, false, Body::Both, true), Plan::Keep);
     }
 
     fn utf16(text: &str) -> Vec<u16> {

@@ -11,7 +11,7 @@ use core::fmt::Write as _;
 use skyline::hooks::{getRegionAddress, InlineCtx, Region};
 use skyline::nn;
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 const DATA_DIR: &str = "sd:/ultimate/elite-rematch";
 const EVENT_RING: usize = 16;
@@ -75,6 +75,10 @@ static TEXT_BASE: AtomicU64 = AtomicU64::new(0);
 static SHOWN: AtomicU32 = AtomicU32::new(0);
 /// `Settings::to_bits`; diagnostic builds reload it from `diag.txt`.
 static SETTINGS: AtomicU32 = AtomicU32::new(0);
+/// The Elite Smash notice was shown in this lobby (set on the UI thread when
+/// a kept popup shows it; cleared when the player leaves or a new search
+/// starts).
+static NOTICE_SHOWN: AtomicBool = AtomicBool::new(false);
 /// `Change::code` of the kept-rematch popup on screen whose notice is shown
 /// with the question; 0 otherwise. Set and read on the UI thread.
 static COMBINE: AtomicU32 = AtomicU32::new(0);
@@ -187,7 +191,8 @@ unsafe fn popup_parsed(ctx: &mut InlineCtx) {
     #[cfg(feature = "diag")]
     log_descriptor("parsed", descriptor);
     let settings = settings();
-    match model::plan(record, settings.retain, settings.body) {
+    let notice_shown = NOTICE_SHOWN.load(Ordering::Acquire);
+    match model::plan(record, settings.retain, settings.body, notice_shown) {
         Plan::Keep => {
             COMBINE.store(0, Ordering::Release);
             let change = Change::of(record);
@@ -221,13 +226,16 @@ unsafe fn popup_parsed(ctx: &mut InlineCtx) {
             // The body is set from its label while the popup is shown, through
             // the message lookup below.
             COMBINE.store(
-                if settings.body == Body::Both {
+                if keep_body && settings.body == Body::Both {
                     change.code()
                 } else {
                     0
                 },
                 Ordering::Release,
             );
+            if keep_body {
+                NOTICE_SHOWN.store(true, Ordering::Release);
+            }
             #[cfg(feature = "diag")]
             COMBINE_LOGGED.store(0, Ordering::Release);
             SHOWN.store(
@@ -240,7 +248,11 @@ unsafe fn popup_parsed(ctx: &mut InlineCtx) {
             push_event(format_args!(
                 "popup record={record:#x} change={} rematch=kept body={}",
                 change.name(),
-                settings.body.name()
+                if keep_body {
+                    settings.body.name()
+                } else {
+                    "rematch"
+                }
             ));
             #[cfg(feature = "diag")]
             log_descriptor("reparsed", descriptor);
@@ -254,6 +266,10 @@ unsafe fn popup_choice(ctx: &mut InlineCtx) {
     let button = read_u32(ctx.registers[8].x() + 0x118);
     let shown = SHOWN.swap(0, Ordering::AcqRel);
     COMBINE.store(0, Ordering::Release);
+    if button != model::REMATCH_BUTTON {
+        // Leaving the lobby: a later Elite Smash change shows its notice again.
+        NOTICE_SHOWN.store(false, Ordering::Release);
+    }
     push_event(format_args!(
         "choice button={button} rematch={} popup={}",
         u8::from(button == model::REMATCH_BUTTON),
@@ -458,16 +474,20 @@ unsafe fn classify(ctx: &mut InlineCtx) {
     ));
 }
 
-/// Eden-only: logs the Elite Smash search delay (parameter 1199, seconds) and
-/// the search mode each time a search is set up. Read-only.
-#[cfg(feature = "diag")]
+/// A new search starts (not a rematch): a new lobby, so the next Elite Smash
+/// change shows its notice. Reads registers only; diagnostic builds also log
+/// the Elite Smash search delay (parameter 1199, seconds) and the mode.
 #[skyline::hook(offset = model::SEARCH_DELAY_OFFSET, inline)]
-unsafe fn search_delay(ctx: &mut InlineCtx) {
-    let delay = ctx.registers[0].w();
-    let mode = read_u32(ctx.registers[25].x() - 4);
+unsafe fn search_setup(ctx: &mut InlineCtx) {
+    NOTICE_SHOWN.store(false, Ordering::Release);
+    #[cfg(feature = "diag")]
     push_event(format_args!(
-        "diag search_delay seconds={delay} mode={mode}"
+        "diag search_delay seconds={} mode={}",
+        ctx.registers[0].w(),
+        read_u32(ctx.registers[25].x() - 4)
     ));
+    #[cfg(not(feature = "diag"))]
+    let _ = ctx;
 }
 
 /// Eden-only: logs the "Elite Smash enabled" parameter when it changes.
@@ -629,7 +649,12 @@ pub fn main() {
             &model::SEARCH_DELAY,
         ]
     } else {
-        &[&model::PARSED, &model::CHOICE, &model::MESSAGE_LOOKUP]
+        &[
+            &model::PARSED,
+            &model::CHOICE,
+            &model::MESSAGE_LOOKUP,
+            &model::SEARCH_DELAY,
+        ]
     };
     for site in sites {
         if !unsafe { guard_matches(site) } {
@@ -657,9 +682,9 @@ pub fn main() {
             threshold.map_or(-1, i64::from)
         );
     }
-    skyline::install_hooks!(popup_parsed, popup_choice, message_lookup);
+    skyline::install_hooks!(popup_parsed, popup_choice, message_lookup, search_setup);
     #[cfg(feature = "diag")]
-    skyline::install_hooks!(popup_select, classify, vip_enabled, search_delay);
+    skyline::install_hooks!(popup_select, classify, vip_enabled);
     let _ = write!(report, " result=installed hooks=");
     for (i, site) in sites.iter().enumerate() {
         let _ = write!(report, "{}{}", if i > 0 { "," } else { "" }, site.name);

@@ -111,9 +111,13 @@ both, the full rematch, No on both.
 
 In runs 4 and 1 (repeated) the Elite console searched alone first and was
 paired with the non-Elite one when its search widened (about 124 s), as on
-Nintendo's servers. The popup after the rematch shows the notice again: the
+Nintendo's servers. The game chose the notice again after the rematch: the
 rematch stays in the session of the first match, so the game compares
-against that tier.
+against that tier. Since 2026-10-30 ~20:10Z the plugin shows the notice once
+per lobby and the plain "Rematch?" after later rematches; a new search
+(`.168a5b8`, which runs for a new search but not for a rematch) or any
+answer but Yes starts over. Unit-tested; the Eden run of this change is
+pending.
 
 ## Not verified yet
 
