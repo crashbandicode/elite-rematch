@@ -19,6 +19,13 @@ before it is displayed.
   other button leaves (code 1), the same mapping for all three records
   (`.147f4d0..147f508`).
 
+- The text: while such a popup is up (from that parse until a button is
+  chosen), the game's message lookup (`.37a4450`) is answered, for the Elite
+  Smash notice's label only, with that notice, a line break and the game's
+  own "Rematch?" (`pop_result_battle_again`), both looked up through the
+  same function so they are in the console's language. Every other lookup
+  returns the game's own text unchanged.
+
 ## What it does not change
 
 - No random draw, no match simulation: the popup runs after the match's
@@ -76,6 +83,14 @@ record.
   error, Eden's known decline gap (`EDEN-GAPS.md` item 4), not the plugin.
 - `ssbu-desync-detector` on both consoles: no check mismatch in any of these
   sessions, the rematch matches included.
+- Mixed install, combined text (15:22-15:33Z): the console with the plugin
+  showed "You can now participate in Elite Smash. Rematch?" with No and Yes;
+  the other console ran no elite-rematch plugin at all. Two rematches in a
+  row (three matches), the detector on both: every session ended with
+  `desync_seen=0` and the same frame counts on both consoles.
+- Release build on both consoles (15:36-15:43Z): installed with all hooks;
+  a match, a rematch (Yes on both), then No on both; the plugin left both
+  ordinary popups as they were, and the detector saw no mismatch.
 
 ## Not verified yet
 

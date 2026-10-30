@@ -5,7 +5,7 @@
 //! ring; the writer thread does the file I/O. No heap (`heap_allocations` in
 //! the install line counts any).
 
-use crate::model::{self, descriptor, Change, Line, Plan, Settings, Site};
+use crate::model::{self, descriptor, Body, Change, Line, Plan, Settings, Site};
 use core::cell::UnsafeCell;
 use core::fmt::Write as _;
 use skyline::hooks::{getRegionAddress, InlineCtx, Region};
@@ -75,6 +75,14 @@ static TEXT_BASE: AtomicU64 = AtomicU64::new(0);
 static SHOWN: AtomicU32 = AtomicU32::new(0);
 /// `Settings::to_bits`; diagnostic builds reload it from `diag.txt`.
 static SETTINGS: AtomicU32 = AtomicU32::new(0);
+/// `Change::code` of the kept-rematch popup on screen whose notice is shown
+/// with the question; 0 otherwise. Set and read on the UI thread.
+static COMBINE: AtomicU32 = AtomicU32::new(0);
+/// The combined text handed to the game; static, so it outlives the lookup.
+static COMBINED: Owned<[u16; model::COMBINED_LEN]> =
+    Owned(UnsafeCell::new([0; model::COMBINED_LEN]));
+#[cfg(feature = "diag")]
+static COMBINE_LOGGED: AtomicU32 = AtomicU32::new(0);
 
 /// The writer thread's object and stack, static so no heap is involved.
 #[repr(C, align(4096))]
@@ -181,6 +189,7 @@ unsafe fn popup_parsed(ctx: &mut InlineCtx) {
     let settings = settings();
     match model::plan(record, settings.retain, settings.body) {
         Plan::Keep => {
+            COMBINE.store(0, Ordering::Release);
             let change = Change::of(record);
             SHOWN.store(
                 match change {
@@ -209,6 +218,18 @@ unsafe fn popup_parsed(ctx: &mut InlineCtx) {
             if keep_body {
                 core::ptr::copy_nonoverlapping(saved.as_ptr(), body, saved.len());
             }
+            // The body is set from its label while the popup is shown, through
+            // the message lookup below.
+            COMBINE.store(
+                if settings.body == Body::Both {
+                    change.code()
+                } else {
+                    0
+                },
+                Ordering::Release,
+            );
+            #[cfg(feature = "diag")]
+            COMBINE_LOGGED.store(0, Ordering::Release);
             SHOWN.store(
                 match change {
                     Change::Entered => 3,
@@ -219,7 +240,7 @@ unsafe fn popup_parsed(ctx: &mut InlineCtx) {
             push_event(format_args!(
                 "popup record={record:#x} change={} rematch=kept body={}",
                 change.name(),
-                if keep_body { "elite" } else { "rematch" }
+                settings.body.name()
             ));
             #[cfg(feature = "diag")]
             log_descriptor("reparsed", descriptor);
@@ -232,11 +253,64 @@ unsafe fn popup_parsed(ctx: &mut InlineCtx) {
 unsafe fn popup_choice(ctx: &mut InlineCtx) {
     let button = read_u32(ctx.registers[8].x() + 0x118);
     let shown = SHOWN.swap(0, Ordering::AcqRel);
+    COMBINE.store(0, Ordering::Release);
     push_event(format_args!(
         "choice button={button} rematch={} popup={}",
         u8::from(button == model::REMATCH_BUTTON),
         shown_name(shown)
     ));
+}
+
+/// A NUL-terminated UTF-16 text of at most `max` units (without the NUL).
+unsafe fn utf16_at<'a>(text: *const u16, max: usize) -> &'a [u16] {
+    if text.is_null() {
+        return &[];
+    }
+    let mut len = 0;
+    while len < max && *text.add(len) != 0 {
+        len += 1;
+    }
+    core::slice::from_raw_parts(text, len)
+}
+
+/// Every message lookup by label. While a kept-rematch popup is up, its
+/// Elite Smash notice is answered with the notice, a line break and the
+/// game's own "Rematch?", both in the console's language.
+#[skyline::hook(offset = model::MESSAGE_LOOKUP_OFFSET)]
+unsafe fn message_lookup(manager: u64, label: *const u8) -> *const u16 {
+    let text = call_original!(manager, label);
+    let Some(change) = Change::from_code(COMBINE.load(Ordering::Acquire)) else {
+        return text;
+    };
+    if label.is_null() || !model::label_matches(|i| *label.add(i), change.label()) {
+        return text;
+    }
+    let question = call_original!(manager, model::LABEL_REMATCH.as_ptr());
+    // SAFETY: only the UI thread looks texts up while COMBINE is set.
+    let out = &mut *COMBINED.0.get();
+    let _len = model::combine(
+        utf16_at(text, model::COMBINED_LEN),
+        utf16_at(question, model::COMBINED_LEN),
+        out,
+    );
+    #[cfg(feature = "diag")]
+    if COMBINE_LOGGED.swap(1, Ordering::AcqRel) == 0 {
+        let mut ascii = Line::<160>::new();
+        for unit in &out[.._len] {
+            let c = char::from_u32(u32::from(*unit)).filter(char::is_ascii_graphic);
+            let _ = ascii.write_char(match (*unit, c) {
+                (0x0a, _) => '|',
+                (0x20, _) => ' ',
+                (_, Some(c)) => c,
+                _ => '?',
+            });
+        }
+        push_event(format_args!(
+            "diag combined units={_len} text={}",
+            core::str::from_utf8(ascii.as_bytes()).unwrap_or("")
+        ));
+    }
+    out.as_ptr()
 }
 
 type Path = Line<96>;
@@ -464,9 +538,14 @@ pub fn main() {
         return;
     }
     let sites: &[&Site] = if cfg!(feature = "diag") {
-        &[&model::SELECT, &model::PARSED, &model::CHOICE]
+        &[
+            &model::SELECT,
+            &model::PARSED,
+            &model::CHOICE,
+            &model::MESSAGE_LOOKUP,
+        ]
     } else {
-        &[&model::PARSED, &model::CHOICE]
+        &[&model::PARSED, &model::CHOICE, &model::MESSAGE_LOOKUP]
     };
     for site in sites {
         if !unsafe { guard_matches(site) } {
@@ -492,7 +571,7 @@ pub fn main() {
             loaded.body.name()
         );
     }
-    skyline::install_hooks!(popup_parsed, popup_choice);
+    skyline::install_hooks!(popup_parsed, popup_choice, message_lookup);
     #[cfg(feature = "diag")]
     skyline::install_hook!(popup_select);
     let _ = write!(report, " result=installed hooks=");

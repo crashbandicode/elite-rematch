@@ -73,6 +73,29 @@ pub const CHOICE: Site = Site {
 /// Native popup parser `(descriptor, record)`, the call at `.147fb60`.
 pub const PARSE_POPUP_OFFSET: usize = 0x32edf70;
 
+/// Message lookup `(manager, label) -> UTF-16 text`: every UI text is fetched
+/// by label through it (e.g. `.37a26fc`, the label setter used by popups).
+pub const MESSAGE_LOOKUP_OFFSET: usize = 0x37a4450;
+pub const MESSAGE_LOOKUP: Site = Site {
+    name: "message_lookup",
+    offset: MESSAGE_LOOKUP_OFFSET,
+    guard: [
+        0xf6, 0x57, 0xbd, 0xa9, 0xf4, 0x4f, 0x01, 0xa9, 0xfd, 0x7b, 0x02, 0xa9, 0xfd, 0x83, 0x00,
+        0x91, 0x61, 0x07, 0x00, 0xb4, 0x28, 0x00, 0x40, 0x39, 0xf3, 0x03, 0x01, 0xaa, 0x08, 0x07,
+        0x00, 0x34, 0x16, 0x0c, 0x40, 0xf9, 0xf4, 0x03, 0x00, 0xaa, 0x15, 0x80, 0x00, 0x91, 0x02,
+        0x00, 0x00, 0x14, 0xf6, 0x03, 0x09, 0xaa, 0xdf, 0x02, 0x15, 0xeb, 0xe0, 0x02, 0x00, 0x54,
+        0xc0, 0x46, 0x40, 0xf9,
+    ],
+};
+
+/// Message labels of the three popup bodies (NUL-terminated, as the game
+/// passes them to the lookup).
+pub const LABEL_REMATCH: &[u8] = b"pop_result_battle_again\0";
+pub const LABEL_ENTERED: &[u8] = b"pop_online_vip_start\0";
+pub const LABEL_LEFT: &[u8] = b"pop_online_vip_end\0";
+/// Longest combined text kept (UTF-16 units, NUL included).
+pub const COMBINED_LEN: usize = 384;
+
 /// Popup records chosen at `.147faa0..147faec`.
 pub const POPUP_ORDINARY: u64 = 0x58ff_ff1c_b2b1_1288;
 pub const POPUP_ENTERED: u64 = 0x58ff_ff19_3b38_def1;
@@ -127,12 +150,80 @@ impl Change {
             Self::Left => "left",
         }
     }
+
+    /// The Elite Smash notice's message label.
+    pub fn label(self) -> &'static [u8] {
+        match self {
+            Self::Entered => LABEL_ENTERED,
+            Self::Left => LABEL_LEFT,
+        }
+    }
+
+    /// 1 or 2, for an atomic; 0 is "none".
+    pub fn code(self) -> u32 {
+        match self {
+            Self::Entered => 1,
+            Self::Left => 2,
+        }
+    }
+
+    pub fn from_code(code: u32) -> Option<Self> {
+        match code {
+            1 => Some(Self::Entered),
+            2 => Some(Self::Left),
+            _ => None,
+        }
+    }
+}
+
+/// Whether the NUL-terminated label whose bytes `byte_at` returns equals
+/// `label` (which includes its NUL). Reads no byte past the first mismatch
+/// or the NUL.
+pub fn label_matches(byte_at: impl Fn(usize) -> u8, label: &[u8]) -> bool {
+    for (i, want) in label.iter().enumerate() {
+        let got = byte_at(i);
+        if got != *want {
+            return false;
+        }
+        if got == 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// The notice, a line break and the rematch question, as one UTF-16 text with
+/// a NUL. Both inputs stop at their first NUL; the result is cut to fit `out`
+/// (the question first loses its tail, then the notice). Returns the units
+/// written before the NUL.
+pub fn combine(notice: &[u16], question: &[u16], out: &mut [u16]) -> usize {
+    let until_nul = |text: &[u16]| text.iter().position(|u| *u == 0).unwrap_or(text.len());
+    let (notice, question) = (
+        &notice[..until_nul(notice)],
+        &question[..until_nul(question)],
+    );
+    let Some(room) = out.len().checked_sub(1) else {
+        return 0;
+    };
+    let mut len = notice.len().min(room);
+    out[..len].copy_from_slice(&notice[..len]);
+    if len < room && !question.is_empty() {
+        out[len] = u16::from(b'\n');
+        len += 1;
+        let take = question.len().min(room - len);
+        out[len..len + take].copy_from_slice(&question[..take]);
+        len += take;
+    }
+    out[len] = 0;
+    len
 }
 
 /// Text of a popup that keeps the rematch after an Elite Smash change.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Body {
-    /// The game's own Elite Smash text, with the rematch buttons.
+    /// The game's Elite Smash notice, then its "Rematch?", one text.
+    Both,
+    /// The game's own Elite Smash text alone, with the rematch buttons.
     Elite,
     /// The ordinary rematch popup unchanged.
     Rematch,
@@ -141,6 +232,7 @@ pub enum Body {
 impl Body {
     pub fn name(self) -> &'static str {
         match self {
+            Self::Both => "both",
             Self::Elite => "elite",
             Self::Rematch => "rematch",
         }
@@ -161,7 +253,7 @@ pub fn plan(record: u64, retain: bool, body: Body) -> Plan {
     match Change::of(record) {
         Some(change) if retain => Plan::Reparse {
             change,
-            keep_body: body == Body::Elite,
+            keep_body: body != Body::Rematch,
         },
         _ => Plan::Keep,
     }
@@ -183,31 +275,28 @@ impl Settings {
     pub const DEFAULT: Self = Self {
         force: None,
         retain: true,
-        body: Body::Elite,
+        body: Body::Both,
     };
 
     /// One word, so the hooks can read settings the writer thread reloads.
     pub fn to_bits(self) -> u32 {
-        let force = match self.force {
-            None => 0,
-            Some(Change::Entered) => 1,
-            Some(Change::Left) => 2,
+        let force = self.force.map_or(0, Change::code);
+        let body = match self.body {
+            Body::Both => 0,
+            Body::Elite => 1,
+            Body::Rematch => 2,
         };
-        force | (u32::from(self.retain) << 2) | (u32::from(self.body == Body::Rematch) << 3)
+        force | (u32::from(self.retain) << 2) | (body << 3)
     }
 
     pub fn from_bits(bits: u32) -> Self {
         Self {
-            force: match bits & 3 {
-                1 => Some(Change::Entered),
-                2 => Some(Change::Left),
-                _ => None,
-            },
+            force: Change::from_code(bits & 3),
             retain: bits & 4 != 0,
-            body: if bits & 8 != 0 {
-                Body::Rematch
-            } else {
-                Body::Elite
+            body: match (bits >> 3) & 3 {
+                1 => Body::Elite,
+                2 => Body::Rematch,
+                _ => Body::Both,
             },
         }
     }
@@ -226,6 +315,7 @@ impl Settings {
                 (b"force", b"none") => settings.force = None,
                 (b"retain", b"0") => settings.retain = false,
                 (b"retain", b"1") => settings.retain = true,
+                (b"body", b"both") => settings.body = Body::Both,
                 (b"body", b"elite") => settings.body = Body::Elite,
                 (b"body", b"rematch") => settings.body = Body::Rematch,
                 _ => {}
@@ -310,6 +400,7 @@ mod tests {
 
     #[test]
     fn guards_start_with_the_hooked_instruction() {
+        assert_eq!(MESSAGE_LOOKUP.guard[..4], [0xf6, 0x57, 0xbd, 0xa9]); // stp x22, x21, [sp, #-0x30]!
         assert_eq!(SELECT.guard[..4], [0x68, 0x0a, 0x40, 0xf9]); // ldr x8, [x19, #0x10]
         assert_eq!(PARSED.guard[..4], [0x60, 0x86, 0x40, 0xa9]); // ldp x0, x1, [x19, #8]
         assert_eq!(CHOICE.guard[..4], [0x08, 0x19, 0x41, 0xb9]); // ldr w8, [x8, #0x118]
@@ -345,6 +436,72 @@ mod tests {
             }
         );
         assert_eq!(plan(POPUP_LEFT, false, Body::Elite), Plan::Keep);
+        assert_eq!(
+            plan(POPUP_ENTERED, true, Body::Both),
+            Plan::Reparse {
+                change: Change::Entered,
+                keep_body: true
+            }
+        );
+    }
+
+    fn utf16(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain([0]).collect()
+    }
+
+    #[test]
+    fn combine_joins_notice_and_question() {
+        let mut out = [0xffffu16; COMBINED_LEN];
+        let len = combine(
+            &utf16("You can now participate\nin Elite Smash."),
+            &utf16("Rematch?"),
+            &mut out,
+        );
+        let text = String::from_utf16(&out[..len]).unwrap();
+        assert_eq!(text, "You can now participate\nin Elite Smash.\nRematch?");
+        assert_eq!(out[len], 0);
+    }
+
+    #[test]
+    fn combine_cuts_to_fit_and_keeps_the_nul() {
+        let mut out = [0xffffu16; 8];
+        let len = combine(&utf16("Notice"), &utf16("Rematch?"), &mut out);
+        assert_eq!(String::from_utf16(&out[..len]).unwrap(), "Notice\n");
+        assert_eq!((len, out[len]), (7, 0));
+        let len = combine(&utf16("A very long notice"), &utf16("Q"), &mut out);
+        assert_eq!(String::from_utf16(&out[..len]).unwrap(), "A very ");
+        assert_eq!(combine(&utf16("x"), &utf16("y"), &mut []), 0);
+        let mut one = [9u16; 1];
+        assert_eq!(
+            (combine(&utf16("x"), &utf16("y"), &mut one), one[0]),
+            (0, 0)
+        );
+        let len = combine(&utf16("Notice"), &utf16(""), &mut out);
+        assert_eq!(String::from_utf16(&out[..len]).unwrap(), "Notice");
+    }
+
+    #[test]
+    fn labels_match_with_their_nul() {
+        let matches = |read: &[u8], label: &[u8]| {
+            label_matches(
+                |i| {
+                    assert!(i < read.len(), "read past the label");
+                    read[i]
+                },
+                label,
+            )
+        };
+        assert!(matches(b"pop_online_vip_start\0junk", LABEL_ENTERED));
+        assert!(!matches(b"pop_online_vip_start_x\0", LABEL_ENTERED));
+        assert!(!matches(b"pop\0", LABEL_ENTERED));
+        assert!(!matches(b"pop_online_vip_end\0", LABEL_ENTERED));
+        assert!(matches(b"pop_online_vip_end\0", LABEL_LEFT));
+        assert!(matches(b"pop_result_battle_again\0", LABEL_REMATCH));
+        for change in [Change::Entered, Change::Left] {
+            assert_eq!(Change::from_code(change.code()), Some(change));
+            assert_eq!(change.label().last(), Some(&0));
+        }
+        assert_eq!(Change::from_code(0), None);
     }
 
     #[test]
@@ -366,7 +523,7 @@ mod tests {
     fn settings_round_trip_through_bits() {
         for force in [None, Some(Change::Entered), Some(Change::Left)] {
             for retain in [false, true] {
-                for body in [Body::Elite, Body::Rematch] {
+                for body in [Body::Both, Body::Elite, Body::Rematch] {
                     let s = Settings {
                         force,
                         retain,
