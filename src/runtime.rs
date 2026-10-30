@@ -458,6 +458,18 @@ unsafe fn classify(ctx: &mut InlineCtx) {
     ));
 }
 
+/// Eden-only: logs the Elite Smash search delay (parameter 1199, seconds) and
+/// the search mode each time a search is set up. Read-only.
+#[cfg(feature = "diag")]
+#[skyline::hook(offset = model::SEARCH_DELAY_OFFSET, inline)]
+unsafe fn search_delay(ctx: &mut InlineCtx) {
+    let delay = ctx.registers[0].w();
+    let mode = read_u32(ctx.registers[25].x() - 4);
+    push_event(format_args!(
+        "diag search_delay seconds={delay} mode={mode}"
+    ));
+}
+
 /// Eden-only: logs the "Elite Smash enabled" parameter when it changes.
 #[cfg(feature = "diag")]
 #[skyline::hook(offset = model::VIP_ENABLED_OFFSET, inline)]
@@ -614,6 +626,7 @@ pub fn main() {
             &model::MESSAGE_LOOKUP,
             &model::CLASSIFY,
             &model::VIP_ENABLED,
+            &model::SEARCH_DELAY,
         ]
     } else {
         &[&model::PARSED, &model::CHOICE, &model::MESSAGE_LOOKUP]
@@ -646,7 +659,7 @@ pub fn main() {
     }
     skyline::install_hooks!(popup_parsed, popup_choice, message_lookup);
     #[cfg(feature = "diag")]
-    skyline::install_hooks!(popup_select, classify, vip_enabled);
+    skyline::install_hooks!(popup_select, classify, vip_enabled, search_delay);
     let _ = write!(report, " result=installed hooks=");
     for (i, site) in sites.iter().enumerate() {
         let _ = write!(report, "{}{}", if i > 0 { "," } else { "" }, site.name);
