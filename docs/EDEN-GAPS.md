@@ -1,58 +1,51 @@
 # Eden LAN Online: what Elite Smash testing needs (2026-10-30)
 
 For the Eden agent. The `elite-rematch` plugin keeps the Quickplay rematch
-when a player enters or leaves Elite Smash. Testing it in Eden needs a GSP
-that moves and an Elite Smash state that can change. Today neither happens in
-LAN Online. No change to the game, Deluxe or the plugin is asked for here.
+when a player enters or leaves Elite Smash. Testing it for real needs a GSP
+that persists and can cross the Elite Smash threshold. No change to the
+game, Deluxe or the plugin is asked for here.
 
-Elite Smash is "VIP" inside the game (`is_vip`, `MODE_VIP`,
-`SEQUENCE_ONLINE_MELEE_ANYONE_VIP`). The decision to enter or leave it is made
-by the game from the fighter's GSP. The GSP itself reaches the game in server
-replies.
+## How the game does it (13.0.5 binary, Eden runs)
 
-## What the game calls and what Eden answers
+- The game computes GSP itself after each match and keeps it in a local
+  cache; Eden shows it moving (Lucario 9,068,494 -> 7,254,021 after a loss,
+  Shulk 9,068,494 -> 10,882,966 after a win; run e01, 2026-10-30).
+- Elite Smash ("VIP" in the game) is decided by the game: the fighter's
+  cached rating against a threshold from the game's own data (parameter
+  1201; `.text+0x17049d0`). No server reply carries the threshold.
+- The server only stores and returns the rating, per player and fighter:
 
-Source: Yoga runs al-a5 / al-b5, 2026-10-18 (`/home/intpa/cov-runs/al-*/console.log`),
-companion `internal/initshape/initshape.go` and `internal/nsoserver/server.go`
-read on the Surface 2026-10-30.
+| Call | When | Request | Reply the game expects | Eden today |
+|---|---|---|---|---|
+| DataStore 0x73 / 84 | entering Online | none | Map<u8 fighter slot, rating record> + an aggregate | operator override file (29 B), same value for every fighter |
+| DataStore 0x73 / 82 | match start and end | version, fighter slot (u8), three u32 values, time (u64), flag (u32) = 30 B | success, no payload | empty success, nothing stored |
+| DataStore 0x73 / 21 | first match | metadata object with a 100 x 9-byte event history | u64 object id | override file (8 B) |
+| DataStore 0x73 / 38 | match start and end | update of that object (id, mask 0x58, history) | success, no payload | empty list |
 
-| Call | Request | When | Eden reply now |
-|---|---|---|---|
-| DataStore 0x73 / 82 | 30 B | each console, match start and match end | empty body |
-| DataStore 0x73 / 38 | 1025 B | each console, match start and match end | empty list |
-| DataStore 0x73 / 21 | 966 B | match start (first match) | override file, 8 B |
-| DataStore 0x73 / 8 | 37 B | before a search | NotFound |
-| DataStore 0x73 / 60, 61, 83, 84, 95 | 0-36 B | entering Online | override files or empty |
-| Utility 0x6e / 7, 9, 10, 11 | 4-26 B | entering Online | override files |
-| MatchmakeExtension 0x6d / 40, 11, 1, 58 | 839, 422, 4, 4 B | each search | implemented |
-| MatchMaking 0x15 / 41, 42 | 4, 5 B | session URLs; host update after a rematch decline | implemented (42 being fixed) |
-
-The server registers no DataStore or MatchmakeReferee protocol of its own;
-`initshape` answers DataStore and Utility with neutral, protocol-shaped
-values. So GSP never changes and no console ever enters or leaves Elite Smash
-in LAN Online.
+Sources: `elite-rematch-work/re/FINDINGS.md` (Q5), Yoga runs al-a5/al-b5
+(2026-10-18), companion `internal/initshape/initshape.go` (Surface,
+2026-10-30). Calls 82/84 go through the game's `TaskRating`; 21/38 through
+its evaluation-history writer.
 
 ## Needed
 
-1. **GSP per player and fighter that changes after each match.** The match-end
-   DataStore calls (82, 38) are the likely report/read pair. Their exact
-   meaning and reply layout are being worked out from the 13.0.5 binary;
-   this section will name them when confirmed.
-2. **An Elite Smash threshold** the game compares GSP against. Where it
-   comes from (a reply above, e.g. the 15,704-byte `0x73_60` override, or
-   another call) is still open.
-3. **A test switch**, per profile or PID: set a fighter's GSP just above or
-   just below the threshold, so the next match moves it across. Acceptance:
-   after one match one console has entered Elite Smash and the other has not;
-   then the reverse (leaving).
-4. **Mixed matchmaking.** On Nintendo's servers a player waiting in Elite
-   Smash is eventually matched with non-Elite players, and their rematches
-   work. Eden's matcher must let an Elite Smash search (0x6d/40 with the
-   VIP flag in its criteria) meet a Quickplay search, at least after a wait.
-5. **Graceful rematch decline** (already planned in the Surface
+1. **Store what 82 writes, return it from 84**, per player and fighter, so
+   GSP survives a restart. An empty 84 map is not "zero GSP": the game then
+   fills slots from local defaults.
+2. **A test switch**: per profile or PID, an 84 reply that puts one fighter's
+   rating just above, or just below, the Elite Smash threshold, so the next
+   match moves it across. Acceptance: after one match a console shows the
+   game's "Elite Smash" notice (`pop_online_vip_start`) instead of
+   "Rematch?" (`pop_result_battle_again`); then the reverse (leaving).
+3. **Mixed matchmaking.** On Nintendo's servers a player waiting in Elite
+   Smash is eventually matched with non-Elite players (the game relaxes its
+   own search after a delay, parameter 1199) and their rematches work. Eden's
+   matcher must let such searches meet.
+4. **Graceful rematch decline** (already planned in the Surface
    `REMATCH_FIX_PLAN.md`): the one who declines leaves; the one who accepted
-   stays without a communication error. Needed for one-console-only tests.
+   stays without a communication error.
 
 ## Not needed
 
-Voice chat, arenas, rankings, real accounts, or any recorded Nintendo bytes.
+The threshold, voice chat, arenas, rankings, real accounts, or any recorded
+Nintendo bytes.
