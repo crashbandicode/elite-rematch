@@ -121,9 +121,18 @@ answer but Yes starts over. Release build (sha256 a85435fc...) in Eden,
 "Rematch?"; leaving, "notice + Rematch?" then "Rematch?"; all rematches
 played to the end, no desync.
 
-## Other plugins on the same sites (0.2.0, 2026-10-30)
+## Other plugins on the same sites (2026-10-30)
 
-Each site is read before it is hooked (`model::entry`):
+Since 0.3.0 the three inline sites use inline-hook sharing v1
+(`src/share.rs`, the same file as in gsp-visualizer): each exports
+`ssbu_inline_site_<offset>_v1`, and the plugin whose export
+`nn::ro::LookupSymbol` finds first hooks the site and calls every other
+plugin's callback after its own; the others register with it and patch
+nothing. Ownership is decided before any byte check, since a guest that
+loads after its owner finds the owner's hook already on the site.
+
+A site hooked by a plugin that does not share is read before it is hooked
+(`model::entry`, 0.2.0):
 
 - the 13.0.5 instructions: hooked as usual;
 - another plugin's Skyline far jump: the plugin chains onto it. The message
@@ -139,17 +148,33 @@ Only the popup hook is required. Without the message lookup the notice shows
 alone, still with No and Yes; without both the choice and the search hook it
 shows on every popup.
 
-Eden, offline, with the 14 other plugins on the test Switch's card
+Eden, with the 14 other plugins on the test Switch's card
 (arcropolis, css_preserve, elite_stages_counterpick, gsp_visualizer,
 imgui_smash, nro_hook, param_hook, smash_gamepad_overlay,
 smash_replay_to_mp4, ssbu_desync_detector, ssbu_online_deluxe_rewrite,
 ssbu_refresh_clock, ssbu_shaderdb_probe, training_modpack):
 
-- 22:16Z: every site stock and hooked (Skyline wrote a one-word branch for
+- 22:16Z, offline: every site stock and hooked (Skyline wrote a one-word branch for
   the inline hooks, a far jump for the lookup); boot and main menu normal.
-- 22:19Z, diagnostic build hooking each site first as another plugin would:
+- 22:19Z, offline, diagnostic build hooking each site first as another plugin would:
   `branch/near` on the three inline sites, `chain/far` on the lookup; the
   menu text, which reaches the game only through the other hook, was normal.
+- 22:44-22:57Z, online (same-PC pair, real entering, the other console
+  without the plugin), 0.2.0 with the same 14 plugins: "notice +
+  Rematch?", Yes on both, rematch to the end, plain "Rematch?", Yes, rematch,
+  then No on both; desync detector `desync_seen=0` on both consoles in all
+  four sessions.
+- 23:02-23:03Z, offline, 0.3.0 with a test plugin that shares `.147fb64`
+  (`test-plugins/share-probe`): loaded after elite-rematch it registered as
+  a guest; loaded first it owned the site and elite-rematch registered
+  (`popup_parsed=guest`). Eden loads plugins in name order.
+- 23:11-23:27Z, online, 0.3.0 with the 14 plugins and that test plugin, a
+  real entering each time, then Yes on both, the rematch, No on both. Test
+  plugin owning `.147fb64`: elite-rematch's popups ("notice + Rematch?", then
+  "Rematch?") came from its hook, and its callback ran once per popup.
+  elite-rematch owning it: the same popups, and the test plugin's callback
+  ran once per popup from elite-rematch's hook. `desync_seen=0` on both
+  consoles in every session.
 
 ## Not verified yet
 
