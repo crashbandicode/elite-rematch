@@ -116,8 +116,10 @@ rematch stays in the session of the first match, so the game compares
 against that tier. Since 2026-10-30 ~20:10Z the plugin shows the notice once
 per lobby and the plain "Rematch?" after later rematches; a new search
 (`.168a5b8`, which runs for a new search but not for a rematch) or any
-answer but Yes starts over. Unit-tested; the Eden run of this change is
-pending.
+answer but Yes starts over. Release build (sha256 a85435fc...) in Eden,
+20:17-20:34Z: entering, three popups "notice + Rematch?", "Rematch?",
+"Rematch?"; leaving, "notice + Rematch?" then "Rematch?"; all rematches
+played to the end, no desync.
 
 ## Not verified yet
 
