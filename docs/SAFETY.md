@@ -186,6 +186,11 @@ the release-build results above come from. Release sections, 0.3.0 → 0.3.1:
 `.text` 333968 → 332128, `.rodata` 87080 → 86776, `.data` 18384 → 18304,
 `.bss` 45480 → 1448 B (about 46 KB less resident); NRO 479232 B.
 
+0.4.0 (2026-10-31) builds the library as a cdylib only. Cargo skips LTO for
+a library that is also an rlib, so `lto = true` had never applied. Resident
+size (`.text` + `.rodata` + `.data` + `.bss` from the NRO header) 472 → 40
+KiB, with the same exported symbols; the code is 0.3.1's.
+
 Eden, 2026-10-30 23:57Z to 10-31 00:05Z, 0.3.1 with the 14 plugins, a real
 entering against a console without the plugin: install line as before;
 "You can now participate in Elite Smash. Rematch?" with No and Yes, Yes on
