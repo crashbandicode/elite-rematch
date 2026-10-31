@@ -176,6 +176,24 @@ ssbu_refresh_clock, ssbu_shaderdb_probe, training_modpack):
   ran once per popup from elite-rematch's hook. `desync_seen=0` on both
   consoles in every session.
 
+## Memory (0.3.1, 2026-10-30)
+
+As in the other plugins, the shipped build holds only the hooks' state: no
+heap allocation (`heap_allocations=0`), no thread, and only its install line
+in `events.log`. The event ring and its writer thread are in the Eden-only
+diagnostic build; release builds before 0.3.1 also logged each popup, which
+the release-build results above come from. Release sections, 0.3.0 → 0.3.1:
+`.text` 333968 → 332128, `.rodata` 87080 → 86776, `.data` 18384 → 18304,
+`.bss` 45480 → 1448 B (about 46 KB less resident); NRO 479232 B.
+
+Eden, 2026-10-30 23:57Z to 10-31 00:05Z, 0.3.1 with the 14 plugins, a real
+entering against a console without the plugin: install line as before;
+"You can now participate in Elite Smash. Rematch?" with No and Yes, Yes on
+both, the rematch to the end, then "Rematch?", No on both; `desync_seen=0`
+in both sessions on both consoles. (An earlier try answered with 3 s left on
+the popup's countdown: both consoles reached the rematch room, then Eden's
+communication error.)
+
 ## Not verified yet
 
 - The Switch, and Nintendo's servers.

@@ -34,9 +34,10 @@ plugin; both choose Yes and meet in the rematch room.*
 ## Install
 
 Copy `libelite_rematch.nro` to
-`sd:/atmosphere/contents/01006A800016E000/romfs/skyline/plugins/`. Popups
-it changes are logged to `sd:/ultimate/elite-rematch/events.log`; on any
-other game version it installs nothing.
+`sd:/atmosphere/contents/01006A800016E000/romfs/skyline/plugins/`. It
+writes one install line to `sd:/ultimate/elite-rematch/events.log` (each
+hook and how it went in); on any other game version it installs nothing.
+Like the other plugins it keeps no thread and makes no heap allocation.
 
 ## More
 

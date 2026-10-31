@@ -1,6 +1,6 @@
 [package]
 name = "elite-rematch"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 publish = false
 description = "Skyline plugin for Super Smash Bros. Ultimate 13.0.5 that keeps the online rematch when a player enters or leaves Elite Smash, with an indicator"

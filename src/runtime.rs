@@ -1,11 +1,11 @@
 //! Switch half: version check, guarded hooks on the post-match popup (shared
 //! with other plugins through inline-hook sharing v1, chained onto hooks that
-//! do not use it), an event ring and a writer thread that appends
-//! `events.log`.
+//! do not use it) and the install line in `events.log`.
 //!
-//! Hooks run on the game's UI thread and only format a line into a static
-//! ring; the writer thread does the file I/O. No heap (`heap_allocations` in
-//! the install line counts any).
+//! As in the other plugins, the shipped build holds only the hooks' state: no
+//! heap (`heap_allocations` in the install line counts any), no thread. The
+//! Eden-only diagnostic build adds an event ring the hooks format lines into
+//! and a writer thread that appends them.
 
 use crate::model::{self, descriptor, Body, Change, Entry, Line, Plan, Settings, Site};
 use crate::share;
@@ -15,11 +15,14 @@ use skyline::hooks::{getRegionAddress, A64HookFunction, A64InlineHook, InlineCtx
 use skyline::libc::c_void;
 use skyline::nn;
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 const DATA_DIR: &str = "sd:/ultimate/elite-rematch";
+#[cfg(feature = "diag")]
 const EVENT_RING: usize = 16;
+#[cfg(feature = "diag")]
 const EVENT_LEN: usize = 448;
+#[cfg(feature = "diag")]
 const WRITER_STACK: usize = 32 * 1024;
 #[cfg(feature = "diag")]
 const OPEN_READ: i32 = 1;
@@ -60,22 +63,26 @@ struct Owned<T>(UnsafeCell<T>);
 unsafe impl<T> Sync for Owned<T> {}
 
 /// One formatted line; `seq` is the event index + 1 once it is complete.
+#[cfg(feature = "diag")]
 struct EventSlot {
     seq: AtomicU64,
     text: Owned<Line<EVENT_LEN>>,
 }
 
+#[cfg(feature = "diag")]
 static EVENTS: [EventSlot; EVENT_RING] = [const {
     EventSlot {
         seq: AtomicU64::new(0),
         text: Owned(UnsafeCell::new(Line::new())),
     }
 }; EVENT_RING];
+#[cfg(feature = "diag")]
 static EVENT_HEAD: AtomicU64 = AtomicU64::new(0);
 
 static TEXT_BASE: AtomicU64 = AtomicU64::new(0);
-/// The popup on screen: 0 ordinary, 1/2 entered/left as the game shows it,
-/// 3/4 entered/left with the rematch kept.
+/// The popup on screen, for the log: 0 ordinary, 1/2 entered/left as the
+/// game shows it, 3/4 entered/left with the rematch kept.
+#[cfg(feature = "diag")]
 static SHOWN: AtomicU32 = AtomicU32::new(0);
 /// `Settings::to_bits`; diagnostic builds reload it from `diag.txt`.
 static SETTINGS: AtomicU32 = AtomicU32::new(0);
@@ -99,14 +106,20 @@ static COMBINED: Owned<[u16; model::COMBINED_LEN]> =
 static COMBINE_LOGGED: AtomicU32 = AtomicU32::new(0);
 
 /// The writer thread's object and stack, static so no heap is involved.
+#[cfg(feature = "diag")]
 #[repr(C, align(4096))]
 struct ThreadStack(UnsafeCell<[u8; WRITER_STACK]>);
+#[cfg(feature = "diag")]
 #[repr(C, align(16))]
 struct ThreadObject(UnsafeCell<[u8; 0x1c0]>);
 // SAFETY: handed to nn::os once, at startup, and never touched again.
+#[cfg(feature = "diag")]
 unsafe impl Sync for ThreadStack {}
+#[cfg(feature = "diag")]
 unsafe impl Sync for ThreadObject {}
+#[cfg(feature = "diag")]
 static WRITER_STACK_MEMORY: ThreadStack = ThreadStack(UnsafeCell::new([0; WRITER_STACK]));
+#[cfg(feature = "diag")]
 static WRITER_THREAD: ThreadObject = ThreadObject(UnsafeCell::new([0; 0x1c0]));
 
 fn tick() -> u64 {
@@ -125,6 +138,7 @@ fn settings() -> Settings {
     Settings::from_bits(SETTINGS.load(Ordering::Acquire))
 }
 
+#[cfg(feature = "diag")]
 fn push_event(args: core::fmt::Arguments) {
     let index = EVENT_HEAD.fetch_add(1, Ordering::AcqRel);
     let slot = &EVENTS[index as usize % EVENT_RING];
@@ -139,6 +153,7 @@ fn push_event(args: core::fmt::Arguments) {
     slot.seq.store(index + 1, Ordering::Release);
 }
 
+#[cfg(feature = "diag")]
 fn shown_name(shown: u32) -> &'static str {
     match shown {
         1 => "entered_native",
@@ -203,19 +218,22 @@ unsafe extern "C" fn popup_parsed(ctx: &mut InlineCtx) {
     match model::plan(record, settings.retain, settings.body, notice_shown) {
         Plan::Keep => {
             COMBINE.store(0, Ordering::Release);
-            let change = Change::of(record);
-            SHOWN.store(
-                match change {
-                    Some(Change::Entered) => 1,
-                    Some(Change::Left) => 2,
-                    None => 0,
-                },
-                Ordering::Release,
-            );
-            push_event(format_args!(
-                "popup record={record:#x} change={} rematch=native",
-                change.map_or("none", Change::name)
-            ));
+            #[cfg(feature = "diag")]
+            {
+                let change = Change::of(record);
+                SHOWN.store(
+                    match change {
+                        Some(Change::Entered) => 1,
+                        Some(Change::Left) => 2,
+                        None => 0,
+                    },
+                    Ordering::Release,
+                );
+                push_event(format_args!(
+                    "popup record={record:#x} change={} rematch=native",
+                    change.map_or("none", Change::name)
+                ));
+            }
         }
         Plan::Reparse { change, keep_body } => {
             let body = (descriptor as usize + descriptor::BODY) as *mut u8;
@@ -245,25 +263,26 @@ unsafe extern "C" fn popup_parsed(ctx: &mut InlineCtx) {
                 NOTICE_SHOWN.store(true, Ordering::Release);
             }
             #[cfg(feature = "diag")]
-            COMBINE_LOGGED.store(0, Ordering::Release);
-            SHOWN.store(
-                match change {
-                    Change::Entered => 3,
-                    Change::Left => 4,
-                },
-                Ordering::Release,
-            );
-            push_event(format_args!(
-                "popup record={record:#x} change={} rematch=kept body={}",
-                change.name(),
-                if keep_body {
-                    settings.body.name()
-                } else {
-                    "rematch"
-                }
-            ));
-            #[cfg(feature = "diag")]
-            log_descriptor("reparsed", descriptor);
+            {
+                COMBINE_LOGGED.store(0, Ordering::Release);
+                SHOWN.store(
+                    match change {
+                        Change::Entered => 3,
+                        Change::Left => 4,
+                    },
+                    Ordering::Release,
+                );
+                push_event(format_args!(
+                    "popup record={record:#x} change={} rematch=kept body={}",
+                    change.name(),
+                    if keep_body {
+                        settings.body.name()
+                    } else {
+                        "rematch"
+                    }
+                ));
+                log_descriptor("reparsed", descriptor);
+            }
         }
     }
 }
@@ -274,16 +293,16 @@ unsafe extern "C" fn popup_choice(ctx: &mut InlineCtx) {
         return;
     }
     let button = read_u32(ctx.registers[8].x() + 0x118);
-    let shown = SHOWN.swap(0, Ordering::AcqRel);
     COMBINE.store(0, Ordering::Release);
     if button != model::REMATCH_BUTTON {
         // Leaving the lobby: a later Elite Smash change shows its notice again.
         NOTICE_SHOWN.store(false, Ordering::Release);
     }
+    #[cfg(feature = "diag")]
     push_event(format_args!(
         "choice button={button} rematch={} popup={}",
         u8::from(button == model::REMATCH_BUTTON),
-        shown_name(shown)
+        shown_name(SHOWN.swap(0, Ordering::AcqRel))
     ));
 }
 
@@ -512,6 +531,7 @@ unsafe extern "C" fn vip_enabled(ctx: &mut InlineCtx) {
 }
 
 /// Copies every published event after `tail` into `events.log`.
+#[cfg(feature = "diag")]
 fn drain(tail: &mut u64) {
     let head = EVENT_HEAD.load(Ordering::Acquire);
     if head == *tail {
@@ -533,7 +553,7 @@ fn drain(tail: &mut u64) {
         // SAFETY: read under the sequence check below.
         let text = unsafe { &*slot.text.0.get() };
         let _ = copy.write_str(core::str::from_utf8(text.as_bytes()).unwrap_or(""));
-        fence(Ordering::Acquire);
+        core::sync::atomic::fence(Ordering::Acquire);
         if seq == *tail + 1 && slot.seq.load(Ordering::Relaxed) == seq {
             file.write(copy.as_bytes());
         }
@@ -572,11 +592,10 @@ fn log_foreign_hits(seen: &mut [u32; 3]) {
     }
 }
 
+#[cfg(feature = "diag")]
 extern "C" fn writer_main(_: *mut c_void) {
     let mut tail = 0;
-    #[cfg(feature = "diag")]
     let mut round = 0u32;
-    #[cfg(feature = "diag")]
     let mut foreign = [0u32; 3];
     loop {
         unsafe {
@@ -584,18 +603,16 @@ extern "C" fn writer_main(_: *mut c_void) {
                 nanoseconds: 200_000_000,
             })
         };
-        #[cfg(feature = "diag")]
-        {
-            round = round.wrapping_add(1);
-            if round.is_multiple_of(10) {
-                reload_settings();
-                log_foreign_hits(&mut foreign);
-            }
+        round = round.wrapping_add(1);
+        if round.is_multiple_of(10) {
+            reload_settings();
+            log_foreign_hits(&mut foreign);
         }
         drain(&mut tail);
     }
 }
 
+#[cfg(feature = "diag")]
 fn start_writer() -> bool {
     unsafe {
         let thread = WRITER_THREAD.0.get().cast::<nn::os::ThreadType>();
@@ -1193,6 +1210,7 @@ pub fn main() {
         if parsed { "installed" } else { "not_installed" }
     );
     report_install(&mut report);
+    #[cfg(feature = "diag")]
     if !start_writer() {
         report.clear();
         let _ = write!(report, "{} writer=not_started", tick());
