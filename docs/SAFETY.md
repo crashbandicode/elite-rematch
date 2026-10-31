@@ -191,6 +191,14 @@ a library that is also an rlib, so `lto = true` had never applied. Resident
 size (`.text` + `.rodata` + `.data` + `.bss` from the NRO header) 472 → 40
 KiB, with the same exported symbols; the code is 0.3.1's.
 
+Eden, 2026-10-31 03:33-03:38Z, 0.4.0 with the card's 15 other plugins:
+install line `popup_parsed=stock/near popup_choice=stock/near
+search_delay=stock/near message_lookup=stock/far result=installed
+heap_allocations=0`; an offline 1v1 ran to the results (no Elite pop-up
+offline). Installed on the Switch at 03:52:53Z over DBI and read back,
+replacing 0.3.1 (`689c423f…`); rollback copy
+`ultimate/elite-rematch/backups/pre-4f13fd146a0b87a2.nro`.
+
 Eden, 2026-10-30 23:57Z to 10-31 00:05Z, 0.3.1 with the 14 plugins, a real
 entering against a console without the plugin: install line as before;
 "You can now participate in Elite Smash. Rematch?" with No and Yes, Yes on
