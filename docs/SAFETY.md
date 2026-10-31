@@ -207,6 +207,25 @@ in both sessions on both consoles. (An earlier try answered with 3 s left on
 the popup's countdown: both consoles reached the rematch room, then Eden's
 communication error.)
 
+## README clips (Eden, 2026-10-31, 15:46-18:24Z)
+
+Same-PC pair, the rating runtime with seeded Lucario ratings (this console
+1641 to enter, 1645 to leave; the other 1500), a real Elite Smash change on
+this console each time, the other console without the plugin, the detector
+on both. Recorded on this console at 1280 × 720, 10 fps.
+
+| Run | elite-rematch | Change | Pop-up | Then | Detector |
+|---|---|---|---|---|---|
+| e27 | none | entered | "You can now participate in Elite Smash.", no buttons, about 1.5 s | Quickplay menu, Elite Smash | no mismatch |
+| e28 | none | left | "The Elite Smash battle has been canceled.", no buttons | Quickplay menu, Solo | no mismatch |
+| e29 | 0.4.0 (`4f13fd14…`) | entered | notice + "Rematch?", No and Yes | Yes on both, rematch room, the rematch to the end, then No on both | no mismatch (2 sessions) |
+| e31 | 0.4.0 | left | notice + "Rematch?", No and Yes | same as e29 | no mismatch (2 sessions) |
+
+0.4.0's install line in e29 and e31: every site `stock`, `result=installed
+heap_allocations=0`. e30 (0.4.0, leaving) is void: both consoles showed
+Eden's error 2306-0332 at the character select before any search, the
+console without the plugin included.
+
 ## Not verified yet
 
 - The Switch, and Nintendo's servers.

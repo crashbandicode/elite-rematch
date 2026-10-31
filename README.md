@@ -10,12 +10,15 @@ rematch when you enter or leave Elite Smash. The game normally replaces
 gone even if both players want one. With the plugin you get both: the notice
 and "Rematch?", with No and Yes.
 
-| Entering Elite Smash | Leaving Elite Smash |
-|---|---|
-| ![Entered](docs/media/entered.gif) | ![Left](docs/media/left.gif) |
+| | Without the plugin | With elite-rematch |
+|---|---|---|
+| **Entering Elite Smash** | ![Entering, without the plugin: the notice has no buttons](docs/media/before-entered.gif) | ![Entering, with the plugin: notice and Rematch? with No and Yes](docs/media/entered.gif) |
+| **Leaving Elite Smash** | ![Leaving, without the plugin: the notice has no buttons](docs/media/before-left.gif) | ![Leaving, with the plugin: notice and Rematch? with No and Yes](docs/media/left.gif) |
 
-*Eden, 2026-10-30: real Elite Smash changes against a console without the
-plugin; both choose Yes and meet in the rematch room.*
+*Eden, 2026-10-31, the same route each time: a real Elite Smash change,
+against a console without the plugin. Without it, the notice closes by
+itself and the game goes back to the Quickplay menu. With 0.4.0, the notice
+asks "Rematch?" too; both choose Yes and meet in the rematch room.*
 
 ## How it works
 
