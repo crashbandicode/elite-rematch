@@ -226,6 +226,17 @@ heap_allocations=0`. e30 (0.4.0, leaving) is void: both consoles showed
 Eden's error 2306-0332 at the character select before any search, the
 console without the plugin included.
 
-## Not verified yet
+## On a Switch
 
-- The Switch, and Nintendo's servers.
+Added 2026-11-13. Until then this section read "Not verified yet: the Switch,
+and Nintendo's servers."
+
+- 0.4.0 (`4f13fd14…`) has been on the operator's Switch card since
+  2026-10-31 03:52:53Z (install receipt above); the latest card install
+  records (2026-11-12) still list it.
+- The card's `events.log`, read back on 2026-11-02, has the same install line
+  on four boots: every site `stock`, `result=installed heap_allocations=0`.
+- On 2026-11-03 the operator reported testing on the Switch online in both
+  directions (Elite Smash, then non-Elite, then Elite Smash again), with the
+  rematch working each time. No console desync-detector results were
+  collected.

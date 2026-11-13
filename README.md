@@ -15,10 +15,11 @@ and "Rematch?", with No and Yes.
 | **Entering Elite Smash** | ![Entering, without the plugin: the notice has no buttons](docs/media/before-entered.gif) | ![Entering, with the plugin: notice and Rematch? with No and Yes](docs/media/entered.gif) |
 | **Leaving Elite Smash** | ![Leaving, without the plugin: the notice has no buttons](docs/media/before-left.gif) | ![Leaving, with the plugin: notice and Rematch? with No and Yes](docs/media/left.gif) |
 
-*Eden, 2026-10-31, the same route each time: a real Elite Smash change,
-against a console without the plugin. Without it, the notice closes by
-itself and the game goes back to the Quickplay menu. With 0.4.0, the notice
-asks "Rematch?" too; both choose Yes and meet in the rematch room.*
+*Eden, 2026-10-31 (runs e27, e28, e29, e31), the same route each time: a
+real Elite Smash change, against a console without the plugin. Without it,
+the notice closes by itself and the game goes back to the Quickplay menu.
+With 0.4.0 (`4f13fd14…`), the notice asks "Rematch?" too; both choose Yes
+and meet in the rematch room.*
 
 ## How it works
 
@@ -33,6 +34,11 @@ asks "Rematch?" too; both choose Yes and meet in the rematch room.*
 - Plays well with other plugins: it shares its hook spots through
   inline-hook sharing v1 (one hook, every plugin's callback), and chains
   onto hooks from plugins that do not share instead of replacing them.
+
+On a Switch: 0.4.0 has been on the operator's card since 2026-10-31. On
+2026-11-03 the operator reported rematches working online in both
+directions, entering and leaving Elite Smash
+([details](docs/SAFETY.md#on-a-switch)).
 
 ## Install
 

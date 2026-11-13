@@ -18,11 +18,16 @@ game, Deluxe or the plugin is asked for here.
 
 - The game computes GSP itself after each match and keeps it in a local
   cache; Eden shows it moving (Lucario 9,068,494 -> 7,254,021 after a loss,
-  Shulk 9,068,494 -> 10,882,966 after a win; run e01, 2026-10-30).
+  Shulk 9,068,494 -> 10,882,966 after a win; the Eden agent's run e91,
+  2026-10-30).
 - Elite Smash ("VIP" in the game) is decided by the game: the fighter's
-  cached rating against a threshold from the game's own data (parameter
-  1201; `.text+0x17049d0`). No server reply carries the threshold.
-- The server only stores and returns the rating, per player and fighter:
+  cached rating against setting 1201 (`.text+0x17049d0`). Corrected
+  2026-11-13: the server does send the threshold. Its Utility
+  GetIntegerSettings reply overrides the game's own parameter for 1201, and
+  the reply Eden replays carries 1201 = 1642 (gsp-visualizer
+  `docs/ELITE-ESTIMATE.md`).
+- For the rating itself, the server only stores and returns it, per player
+  and fighter:
 
 | Call | When | Request | Reply the game expects | Eden today |
 |---|---|---|---|---|
@@ -56,5 +61,5 @@ its evaluation-history writer.
 
 ## Not needed
 
-The threshold, voice chat, arenas, rankings, real accounts, or any recorded
-Nintendo bytes.
+The threshold (the settings reply Eden already replays carries it), voice
+chat, arenas, rankings, real accounts, or any recorded Nintendo bytes.
